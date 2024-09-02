@@ -5,20 +5,24 @@ import (
 	"sync"
 )
 
+type buffer struct {
+	bytes.Buffer
+}
+
 var pool = &sync.Pool{
 	New: func() any {
-		return &bytes.Buffer{}
+		return &buffer{}
 	},
 }
 
-func Get() *bytes.Buffer {
-	return pool.Get().(*bytes.Buffer)
+func Get() *buffer {
+	return pool.Get().(*buffer)
 }
 
-func Release(buf *bytes.Buffer) {
-	if buf == nil {
+func (this *buffer) Release() {
+	if this == nil {
 		return
 	}
-	buf.Reset()
-	pool.Put(buf)
+	this.Reset()
+	pool.Put(this)
 }
