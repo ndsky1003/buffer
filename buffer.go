@@ -31,6 +31,8 @@ func (this *buffer) Release() {
 	pool.Put(this)
 }
 
+// 默认的copy一份,避免共用底层,修改会影响当前数据
+// this.Buffer.Bytes() 返回没copy的data
 func (this *buffer) Bytes() []byte {
 	bs := this.Buffer.Bytes()
 	b := make([]byte, len(bs))
