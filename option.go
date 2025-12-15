@@ -5,25 +5,25 @@ func Options() *Option {
 }
 
 type Option struct {
-	CalibrateCalls *uint64
-	MaxPercentile  *float64
-	MinSize        *uint64
-	MaxSize        *uint64
-	CalibratedSz   *uint64
+	CalibratePeriod *uint64  //校准周期
+	MaxPercent      *float64 //相当于一个门卫,当cap超过CalibratedSz 就交给gc释放
+	MinSize         *uint64  //最小尺寸
+	MaxSize         *uint64  //最大尺寸
+	CalibratedSz    *uint64  //当前初始的校准尺寸
 }
 
-func (o *Option) SetCalibrateCalls(v uint64) *Option {
+func (o *Option) SetCalibratePeriod(v uint64) *Option {
 	if o == nil {
 		o = &Option{}
 	}
-	o.CalibrateCalls = &v
+	o.CalibratePeriod = &v
 	return o
 }
-func (o *Option) SetMaxPercentile(v float64) *Option {
+func (o *Option) SetMaxPercent(v float64) *Option {
 	if o == nil {
 		o = &Option{}
 	}
-	o.MaxPercentile = &v
+	o.MaxPercent = &v
 	return o
 }
 func (o *Option) SetMinSize(v uint64) *Option {
@@ -53,11 +53,11 @@ func (o *Option) merge(delta *Option) {
 	if delta == nil || o == nil {
 		return
 	}
-	if delta.CalibrateCalls != nil {
-		o.CalibrateCalls = delta.CalibrateCalls
+	if delta.CalibratePeriod != nil {
+		o.CalibratePeriod = delta.CalibratePeriod
 	}
-	if delta.MaxPercentile != nil {
-		o.MaxPercentile = delta.MaxPercentile
+	if delta.MaxPercent != nil {
+		o.MaxPercent = delta.MaxPercent
 	}
 	if delta.MinSize != nil {
 		o.MinSize = delta.MinSize

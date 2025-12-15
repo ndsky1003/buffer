@@ -38,10 +38,10 @@ type Pool[T any] struct {
 	statFunc  func(T) (used, cap uint64)
 
 	// 1. 配置参数 (只读，无需原子操作)
-	minSize       uint64
-	maxSize       uint64
-	calibrateFreq uint64
-	maxPercentile float64
+	minSize         uint64
+	maxSize         uint64
+	calibratePeriod uint64
+	maxPercent      float64
 
 	_ padding // 隔离只读区和读写区
 
@@ -56,21 +56,21 @@ type Pool[T any] struct {
 // New 创建一个新的智能池
 func New[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (uint64, uint64), opts ...*Option) *Pool[T] {
 	opt := Options().
-		SetMinSize(512).         // 最小不小于 512B
-		SetMaxSize(64 << 20).    // 最大不超过 64MB (防止 OOM) 64<< 10 是64k
-		SetCalibrateCalls(1000). //多久校准一次
-		SetMaxPercentile(2.0).
+		SetMinSize(512).          // 最小不小于 512B
+		SetMaxSize(64 << 20).     // 最大不超过 64MB (防止 OOM) 64<< 10 是64k
+		SetCalibratePeriod(1000). //多久校准一次
+		SetMaxPercent(2.0).
 		SetCalibratedSz(1024). //校准就是修改这个size,最新适合的size
 		Merge(opts...)
 	p := &Pool[T]{
-		minSize:       *opt.MinSize,
-		maxSize:       *opt.MaxSize,
-		calibrateFreq: *opt.CalibrateCalls,
-		maxPercentile: *opt.MaxPercentile,
-		calibratedSz:  *opt.CalibratedSz, // 初始猜测值
-		makeFunc:      makeFunc,
-		resetFunc:     resetFunc,
-		statFunc:      statFunc,
+		minSize:         *opt.MinSize,
+		maxSize:         *opt.MaxSize,
+		calibratePeriod: *opt.CalibratePeriod,
+		maxPercent:      *opt.MaxPercent,
+		calibratedSz:    *opt.CalibratedSz, // 初始猜测值
+		makeFunc:        makeFunc,
+		resetFunc:       resetFunc,
+		statFunc:        statFunc,
 	}
 
 	// 确保初始值合法
@@ -122,6 +122,9 @@ func (p *Pool[T]) Put(b T) {
 		// 仅在确实较大时尝试更新。
 		// 简化策略：为了极致性能，非突增情况，我们甚至可以不更新 maxUsage，
 		// 因为 calibrate 会自动处理收缩。我们只关注“撑大”的情况。
+		if atomic.LoadUint64(&p.calls)&0x0F == 0 {
+			shouldRecord = true
+		}
 	}
 
 	if shouldRecord {
@@ -139,7 +142,7 @@ func (p *Pool[T]) Put(b T) {
 
 	// 2. 触发校准 (原子计数器)
 	newCalls := atomic.AddUint64(&p.calls, 1)
-	if newCalls >= p.calibrateFreq {
+	if newCalls >= p.calibratePeriod {
 		// 只有获得重置权的那个 goroutine 去执行 calibrate
 		if atomic.CompareAndSwapUint64(&p.calls, newCalls, 0) {
 			p.calibrate()
@@ -149,7 +152,7 @@ func (p *Pool[T]) Put(b T) {
 	// 3. 智能丢弃判决
 	// 如果当前 buffer 容量远超当前需要的尺寸，归还给 pool 会导致内存泄漏（虚高）。
 	// 直接丢弃，让 GC 回收。
-	if capVal > uint64(float64(currentSz)*p.maxPercentile) {
+	if capVal > uint64(float64(currentSz)*p.maxPercent) {
 		return
 	}
 
@@ -159,7 +162,7 @@ func (p *Pool[T]) Put(b T) {
 	p.pool.Put(b)
 }
 
-// calibrate 计算新的基准大小 (核心算法)
+// calibrate 计算周期内新的基准大小 (核心算法)
 // 此方法在单独的 goroutine 或低频路径执行，不需要极度优化，重在算法逻辑
 func (p *Pool[T]) calibrate() {
 	// 1. 获取并重置本周期的最大使用量
