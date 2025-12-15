@@ -1,3 +1,7 @@
+#### 安装
+```golang
+go get  github.com/ndsky1003/buffer/v2
+```
 #### 问题
 1. 同一个bytes.Buffer使用的底层结构是同一个,包括其Bytes方法返回的[]byte
     1. 第一步获取一个buf,使用完了,返回这个buf.Bytes(),这个方法不是其copy,是共用底层空间的

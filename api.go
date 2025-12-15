@@ -16,6 +16,9 @@ func NewBufferPool(opts ...*Option) *Pool[*bytes.Buffer] {
 		},
 		// stat
 		func(b *bytes.Buffer) (uint64, uint64) {
+			if b == nil {
+				return 0, 0
+			}
 			return uint64(b.Len()), uint64(b.Cap())
 		},
 		opts...,
@@ -35,6 +38,9 @@ func NewBytePool(opts ...*Option) *Pool[[]byte] {
 		},
 		// stat: 使用内置 len/cap
 		func(b []byte) (uint64, uint64) {
+			if b == nil {
+				return 0, 0
+			}
 			return uint64(len(b)), uint64(cap(b))
 		},
 		opts...,
