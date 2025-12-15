@@ -1,3 +1,4 @@
+// 算法在工作，但“刹车”踩得太死（0.9），且“垃圾桶”口子开得太大（2.0），导致在短暂的测试周期内来不及清理历史库存。
 package buffer
 
 import (
@@ -14,7 +15,7 @@ const (
 	// emaDownFactor: 下跌时的平滑因子 (0~1)。
 	// 值越大，对历史越执着（跌得越慢）。0.9 代表保留 90% 历史，只接纳 10% 下跌。
 	// 这有助于在流量波动时保持水位，避免频繁扩容。
-	emaDownFactor = 0.9
+	emaDownFactor = 0.8
 
 	// premiumFactor: 溢价系数。
 	// 为了防止 EMA 算法永远逼近但达不到最大值，我们给结果增加 5% 的余量。
@@ -59,7 +60,7 @@ func New[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (
 		SetMinSize(512).          // 最小不小于 512B
 		SetMaxSize(64 << 20).     // 最大不超过 64MB (防止 OOM) 64<< 10 是64k
 		SetCalibratePeriod(1000). //多久校准一次
-		SetMaxPercent(2.0).
+		SetMaxPercent(1.5).
 		SetCalibratedSz(1024). //校准就是修改这个size,最新适合的size
 		Merge(opts...)
 	p := &Pool[T]{
