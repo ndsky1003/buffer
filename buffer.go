@@ -111,6 +111,7 @@ func (p *Pool[T]) Put(b T) {
 	// 策略：如果流量突增(used > current)，必须记录；否则低概率采样记录。
 	currentSz := atomic.LoadUint64(&p.calibratedSz)
 	shouldRecord := false
+	newCalls := atomic.AddUint64(&p.calls, 1)
 
 	if used > currentSz {
 		// 流量突增，必须记录，防止下一轮分配过小
@@ -123,7 +124,7 @@ func (p *Pool[T]) Put(b T) {
 		// 仅在确实较大时尝试更新。
 		// 简化策略：为了极致性能，非突增情况，我们甚至可以不更新 maxUsage，
 		// 因为 calibrate 会自动处理收缩。我们只关注“撑大”的情况。
-		if atomic.LoadUint64(&p.calls)&0x0F == 0 {
+		if newCalls&0x0F == 0 {
 			shouldRecord = true
 		}
 	}
@@ -142,11 +143,11 @@ func (p *Pool[T]) Put(b T) {
 	}
 
 	// 2. 触发校准 (原子计数器)
-	newCalls := atomic.AddUint64(&p.calls, 1)
 	if newCalls >= p.calibratePeriod {
 		// 只有获得重置权的那个 goroutine 去执行 calibrate
 		if atomic.CompareAndSwapUint64(&p.calls, newCalls, 0) {
 			p.calibrate()
+			currentSz = atomic.LoadUint64(&p.calibratedSz)
 		}
 	}
 

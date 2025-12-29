@@ -1,7 +1,6 @@
 package buffer
 
 import (
-	"sync"
 	"sync/atomic"
 )
 
@@ -21,11 +20,12 @@ const (
 )
 
 type AdaptiveRingPool[T any] struct {
-	mu     sync.Mutex // 单锁，性能足够，个人项目不用换自旋锁
-	buffer []T        // 环形队列底层数组
-	head   int        // 队头：取数据位置
-	tail   int        // 队尾：放数据位置
-	count  int        // 当前空闲对象数
+	// mu     sync.Mutex // 单锁，性能足够，个人项目不用换自旋锁
+	mu     SpinLock
+	buffer []T // 环形队列底层数组
+	head   int // 队头：取数据位置
+	tail   int // 队尾：放数据位置
+	count  int // 当前空闲对象数
 
 	minCap int // 最小容量（保底）
 	maxCap int // 最大容量（封顶）
