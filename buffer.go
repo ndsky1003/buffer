@@ -1,9 +1,11 @@
-// 算法在工作，但“刹车”踩得太死（0.9），且“垃圾桶”口子开得太大（2.0），导致在短暂的测试周期内来不及清理历史库存。
+// 算法在工作，但"刹车"踩得太死（0.9），且"垃圾桶"口子开得太大（2.0），导致在短暂的测试周期内来不及清理历史库存。
 package buffer
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
+	_ "unsafe"
 )
 
 const (
@@ -28,9 +30,16 @@ const (
 // cacheLineSize 通常是 64 字节。我们用 padding 防止伪共享。
 type padding [64]byte
 
-// Pool 是一个自动伸缩的 bytes.Buffer 池
+// shard 单个CPU分片的对象池
+type shard[T any] struct {
+	mu    sync.Mutex
+	idle  []T  // 空闲对象列表
+}
+
+// Pool 是一个自动伸缩的 bytes.Buffer 池（基于 per-CPU sharding，不依赖 GC）
 type Pool[T any] struct {
-	pool sync.Pool
+	shards []*shard[T] // 每个 CPU 核心一个分片，替代 sync.Pool
+
 	// --- 适配器函数 (核心变化) ---
 	// 这些函数消除了 *bytes.Buffer 和 []byte 的差异
 	// 虽然是函数指针调用，但在现代 CPU 上开销极低
@@ -43,6 +52,7 @@ type Pool[T any] struct {
 	maxSize         uint64
 	calibratePeriod uint64
 	maxPercent      float64
+	maxIdlePerShard int // 每个分片最大空闲对象数，防止无限增长
 
 	_ padding // 隔离只读区和读写区
 
@@ -63,11 +73,23 @@ func New[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (
 		SetMaxPercent(1.5).
 		SetCalibratedSz(1024). //校准就是修改这个size,最新适合的size
 		Merge(opts...)
+
+	// 初始化 per-CPU 分片
+	numCPU := runtime.NumCPU()
+	shards := make([]*shard[T], numCPU)
+	for i := 0; i < numCPU; i++ {
+		shards[i] = &shard[T]{
+			idle: make([]T, 0, 64), // 预分配容量，初始为 0
+		}
+	}
+
 	p := &Pool[T]{
+		shards:          shards,
 		minSize:         *opt.MinSize,
 		maxSize:         *opt.MaxSize,
 		calibratePeriod: *opt.CalibratePeriod,
 		maxPercent:      *opt.MaxPercent,
+		maxIdlePerShard: 64, // 每个分片最多保留 64 个空闲对象
 		calibratedSz:    *opt.CalibratedSz, // 初始猜测值
 		makeFunc:        makeFunc,
 		resetFunc:       resetFunc,
@@ -77,19 +99,29 @@ func New[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (
 	// 确保初始值合法
 	p.calibratedSz = max(p.minSize, p.calibratedSz)
 
-	p.pool.New = func() any {
-		// 原子读取当前的校准大小
-		size := atomic.LoadUint64(&p.calibratedSz)
-		return p.makeFunc(size)
-	}
-
 	return p
 }
 
 // Get 获取原生 *bytes.Buffer (零分配)
 func (p *Pool[T]) Get() T {
-	// 类型断言在 Go 中非常快
-	return p.pool.Get().(T)
+	// 获取当前 Goroutine 绑定的分片
+	shardIdx := runtime_procPin() % len(p.shards)
+	runtime_procUnpin()
+	shard := p.shards[shardIdx]
+
+	shard.mu.Lock()
+	// 优先从空闲列表获取对象
+	if len(shard.idle) > 0 {
+		obj := shard.idle[len(shard.idle)-1]
+		shard.idle = shard.idle[:len(shard.idle)-1]
+		shard.mu.Unlock()
+		return obj
+	}
+	shard.mu.Unlock()
+
+	// 空闲列表为空，创建新对象（使用当前的校准大小）
+	size := atomic.LoadUint64(&p.calibratedSz)
+	return p.makeFunc(size)
 }
 
 // Put 归还并智能处理
@@ -122,7 +154,7 @@ func (p *Pool[T]) Put(b T) {
 		// 简单起见，利用 calls 的低位在下面做判断也可以，这里为了逻辑分离，
 		// 仅在确实较大时尝试更新。
 		// 简化策略：为了极致性能，非突增情况，我们甚至可以不更新 maxUsage，
-		// 因为 calibrate 会自动处理收缩。我们只关注“撑大”的情况。
+		// 因为 calibrate 会自动处理收缩。我们只关注"撑大"的情况。
 		if atomic.LoadUint64(&p.calls)&0x0F == 0 {
 			shouldRecord = true
 		}
@@ -152,15 +184,26 @@ func (p *Pool[T]) Put(b T) {
 
 	// 3. 智能丢弃判决
 	// 如果当前 buffer 容量远超当前需要的尺寸，归还给 pool 会导致内存泄漏（虚高）。
-	// 直接丢弃，让 GC 回收。
+	// 直接丢弃，不放入池中。
 	if capVal > uint64(float64(currentSz)*p.maxPercent) {
 		return
 	}
 
+	// 4. 归还到当前 CPU 分片的空闲列表
 	// 必须 Reset 才能复用
-	// b.Reset()
 	p.resetFunc(b)
-	p.pool.Put(b)
+
+	shardIdx := runtime_procPin() % len(p.shards)
+	runtime_procUnpin()
+	shard := p.shards[shardIdx]
+
+	shard.mu.Lock()
+	// 如果空闲列表未满，放回池中
+	if len(shard.idle) < p.maxIdlePerShard {
+		shard.idle = append(shard.idle, b)
+	}
+	// 超过最大空闲数，直接丢弃（不放入池）
+	shard.mu.Unlock()
 }
 
 // calibrate 计算周期内新的基准大小 (核心算法)
@@ -210,3 +253,10 @@ func (p *Pool[T]) calibrate() {
 	// 7. 原子更新最终值
 	atomic.StoreUint64(&p.calibratedSz, nextSz)
 }
+
+//go:linkname runtime_procPin runtime.procPin
+func runtime_procPin() int
+
+//go:linkname runtime_procUnpin runtime.procUnpin
+func runtime_procUnpin()
+
