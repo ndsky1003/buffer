@@ -1,3 +1,7 @@
+#### NOTE:
+> 这个库使用了`sync.Pool` 依赖于应用层的gc，会导致恶性循环
+
+
 #### 安装
 ```golang
 go get  github.com/ndsky1003/buffer/v2
