@@ -634,3 +634,55 @@ func TestAdaptiveRingResizeShrink(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// 自适应伸缩方向回归测试
+// =============================================================================
+
+// TestAdaptiveRingNoInfiniteGrow 回归：单对象串行复用（命中率趋近 100%），
+// 旧逻辑「命中率高→扩容」会让池子无限扩张到 maxCap（实际只用 1 个对象）；
+// 修复后应始终保持 minCap，且冷启动首次 miss 不应误触发扩容。
+func TestAdaptiveRingNoInfiniteGrow(t *testing.T) {
+	p := NewAdaptiveRingPool(func() *bytes.Buffer { return &bytes.Buffer{} })
+	for i := 0; i < 100000; i++ {
+		b := p.Get()
+		p.Put(b)
+		if p.curCap != p.minCap {
+			t.Fatalf("第 %d 次后 curCap=%d，期望始终 minCap=%d（不应扩容）", i, p.curCap, p.minCap)
+		}
+	}
+}
+
+// TestAdaptiveRingGrowOnMiss 回归：持续 miss（池子不够用）应扩容。
+func TestAdaptiveRingGrowOnMiss(t *testing.T) {
+	p := NewAdaptiveRingPoolWithLimit(32, 512, func() *bytes.Buffer { return &bytes.Buffer{} })
+	for i := 0; i < 2000; i++ {
+		b := p.Get() // 池子几乎一直空，大量 miss
+		if i%50 == 0 {
+			p.Put(b) // 偶尔归还，触发 autoScale
+		}
+	}
+	if p.curCap <= p.minCap {
+		t.Fatalf("持续 miss 后 curCap=%d，期望 > minCap=%d（应扩容）", p.curCap, p.minCap)
+	}
+}
+
+// TestAdaptiveRingPeriodicReset 验证周期采样：命中率居中时，getCount 达到周期长度即重置，
+// 不会无限累积（否则命中率对近期流量变化不敏感）。
+func TestAdaptiveRingPeriodicReset(t *testing.T) {
+	p := NewAdaptiveRingPool(func() *bytes.Buffer { return &bytes.Buffer{} })
+	maxGC := int64(0)
+	// 稳定 50% 命中率（一半持有一半放回），命中率居中，应周期重置
+	for i := 0; i < 20000; i++ {
+		b := p.Get()
+		if i%2 == 0 {
+			p.Put(b)
+		}
+		if gc := p.getCount.Load(); gc > maxGC {
+			maxGC = gc
+		}
+	}
+	if maxGC > calibrateSamples*2 {
+		t.Fatalf("getCount 峰值=%d 远超周期长度 %d，周期重置未生效", maxGC, calibrateSamples)
+	}
+}

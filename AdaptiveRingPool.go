@@ -2,8 +2,6 @@ package buffer
 
 import (
 	"sync/atomic"
-
-	"golang.org/x/sys/cpu"
 )
 
 // -------------------------- 核心配置（个人项目无脑用默认值，不用改） --------------------------
@@ -16,45 +14,28 @@ const (
 	ScaleUpFactor = 1.2
 	// 缩容因子：闲时缩容0.8倍，平缓缩容，保留足够的空闲buffer
 	ScaleDownFactor = 0.8
-	// 命中率阈值：>0.8扩容，<0.2缩容，业界通用最优值，不用调
+	// 命中率阈值：<0.2 扩容（miss 多、池子不够用），>0.8 缩容（hit 多、池子过剩）
 	HitRateHigh = 0.8
 	HitRateLow  = 0.2
+	// 采样周期：每 calibrateSamples 次 Get 判断一次命中率，命中率反映「最近一个周期」而非累计，
+	// 对近期流量变化更敏感；周期结束（无论是否伸缩）都重置统计。
+	calibrateSamples = 1000
 )
 
+// 注意：本结构体字段由自旋锁串行化访问（关联访问）。
+// 实测缓存行填充（padding）反而破坏局部性、降低吞吐，故采用紧凑排列。
 type AdaptiveRingPool[T any] struct {
-	_ cpu.CacheLinePad
-	// --------------- 第一缓存行：锁（x86_64热点，独占64字节）---------------
-	// SpinLock占4字节，填充60字节，刚好占满64字节缓存行
-	mu SpinLock
-	_  cpu.CacheLinePad
-
-	// --------------- 第二缓存行：核心热点字段（head/tail/count）---------------
-	// int在x86_64是4字节，3个字段合计12字节，填充52字节占满64字节
-	head  int // 取数位置（高频读写）
-	tail  int // 放数位置（高频读写）
-	count int // 空闲数（高频读写）
-	_     cpu.CacheLinePad
-
-	// --------------- 第三缓存行：原子统计变量（x86_64原子操作需对齐）---------------
-	// atomic.Int64是8字节，2个字段合计16字节，填充48字节占满64字节
+	mu       SpinLock     // 锁（高频）
+	head     int          // 取数位置（高频读写）
+	tail     int          // 放数位置（高频读写）
+	count    int          // 空闲数（高频读写）
 	hitCount atomic.Int64 // 命中数（高频读，低频写）
 	getCount atomic.Int64 // 总获取数（高频写）
-	_        cpu.CacheLinePad
-
-	// --------------- 第四缓存行：容量控制字段（冷字段）---------------
-	// 3个int合计12字节，填充52字节占满64字节
-	minCap int // 最小容量（几乎不修改）
-	maxCap int // 最大容量（初始化后不变）
-	curCap int // 当前容量（低频修改）
-	_      cpu.CacheLinePad
-
-	// --------------- 第五缓存行：函数指针+缓冲区（最冷字段）---------------
-	// New（函数指针，8字节） + buffer（切片，24字节） = 32字节，填充32字节占满64字节
-	New func() T // 创建函数（初始化后不变）
-	_   cpu.CacheLinePad
-
-	buffer []T // 环形队列（低频大尺寸访问）
-	_      cpu.CacheLinePad
+	minCap   int          // 最小容量（几乎不修改）
+	maxCap   int          // 最大容量（初始化后不变）
+	curCap   int          // 当前容量（低频修改）
+	New      func() T     // 创建函数（初始化后不变）
+	buffer   []T          // 环形队列（低频大尺寸访问）
 }
 
 // NewAdaptiveRingPool 创建自适应环形池，个人项目无脑用这个，默认配置足够
@@ -119,32 +100,34 @@ func (p *AdaptiveRingPool[T]) Put(obj T) {
 
 // autoScale 自动学习+扩容缩容核心逻辑，必须在持有 p.mu 时调用。
 func (p *AdaptiveRingPool[T]) autoScale() {
-	// 总获取数为0，无需伸缩
+	// 周期采样：样本不足一个周期时不做判断（也避免了冷启动首次 miss 的误判）
 	total := p.getCount.Load()
-	if total == 0 {
+	if total < calibrateSamples {
 		return
 	}
 
-	// 计算命中率
+	// 计算本周期命中率
 	hitRate := float64(p.hitCount.Load()) / float64(total)
 
-	// 情况1：命中率过高 → 忙时，扩容
-	if hitRate > HitRateHigh && p.curCap < p.maxCap {
+	// 情况1：命中率过低（miss 多，池子不够用）→ 扩容
+	if hitRate < HitRateLow && p.curCap < p.maxCap {
 		newCap := int(float64(p.curCap) * ScaleUpFactor)
 		newCap = min(newCap, p.maxCap)
-		p.resize(newCap)
+		p.resize(newCap) // resize 会重置统计
 		return
 	}
 
-	// 情况2：命中率过低 → 闲时，缩容
-	if hitRate < HitRateLow && p.curCap > p.minCap {
+	// 情况2：命中率过高（hit 多，池子过剩）→ 缩容
+	if hitRate > HitRateHigh && p.curCap > p.minCap {
 		newCap := int(float64(p.curCap) * ScaleDownFactor)
 		newCap = max(newCap, p.minCap)
-		p.resize(newCap)
+		p.resize(newCap) // resize 会重置统计
 		return
 	}
 
-	// 情况3：命中率适中，不做任何操作，维持当前容量
+	// 情况3：命中率适中，不伸缩，但强制重置统计，开始新周期
+	p.hitCount.Store(0)
+	p.getCount.Store(0)
 }
 
 // resize 环形队列的扩容/缩容实现，必须在持有 p.mu 时调用。

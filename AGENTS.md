@@ -33,11 +33,14 @@ go test -bench .                  # 基准测试
 - 每 `calibratePeriod` 次 Put 校准一次（默认 1000）
 - 归还时若 `cap > calibratedSz * maxPercent` 直接丢弃交给 GC（防止超大 buffer 滞留）
 
-`AdaptiveRingPool[T]`（`pool.go`）：用 64 字节缓存行填充（`_ [N]byte`）防止伪共享，自旋锁保护；按命中率自适应扩容/缩容。
+`AdaptiveRingPool[T]`（`AdaptiveRingPool.go`）：自旋锁保护的环形队列，按命中率自适应扩容/缩容。字段**紧凑排列**——锁已串行化访问，实测缓存行填充反而破坏局部性、降低吞吐（多核下慢 1.3~1.7×）。
+
+`FixedRingPool[T]`（`FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（而非丢弃），保持池子为最新对象。适合容量可预先确定、追求极致吞吐的场景。
 
 ## 关键陷阱
 
 - **校准基准是 `Len`（实际使用量），不是 `Cap`**：`Put` 里 `used = Len`，仅当 `Len==0`（只 `Grow` 不 `Write`）时回退用 `Cap`。缩容靠 `Len`，所以测试/基准要验证「写不满→缩容」必须真实 `Write` 数据（只 `Grow` 会让 `Len` 全 0，走 `Cap` 回退，测不出缩容）。见 `simulation_test.go`。
+- **`AdaptiveRingPool` 伸缩方向别改反**：`autoScale` 是「命中率**低**（miss 多，池子不够用）→ **扩容**；命中率**高**（hit 多，池子过剩）→ **缩容**」。命中率 = `Get` 时池子有空闲对象的比例。曾因写成反的导致「单对象串行复用」无限扩容到 `maxCap`（见 `TestAdaptiveRingNoInfiniteGrow` 回归测试）。
 - `Put(nil)` 安全（`statFunc` 返回 cap 0，直接 return）。
 
 ## 结构
@@ -45,7 +48,8 @@ go test -bench .                  # 基准测试
 - `buffer.go` — 核心 `Pool[T]`：EMA 校准 + 智能丢弃。
 - `api.go` — `NewBufferPool` / `NewBytePool` 便捷构造函数。
 - `option.go` — `Options()` builder（`SetMinSize/SetMaxSize/SetMaxPercent/SetCalibratePeriod/SetCalibratedSz`），方法对 nil 接收者安全，可链式调用。
-- `pool.go` — `AdaptiveRingPool[T]` 环形队列：缓存行填充 + 自旋锁 + 自适应扩容/缩容。
+- `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：自旋锁 + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
+- `FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。
 - `SpinLock.go` — 自旋锁实现。
 
 ## 公共 API
