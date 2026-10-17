@@ -1,6 +1,7 @@
 package buffer
 
 import (
+	"bytes"
 	"runtime"
 	"sync"
 	"testing"
@@ -353,7 +354,7 @@ func TestConcurrentCalibration(t *testing.T) {
 			// 波动流量
 			for j := 0; j < opsPerGoroutine; j++ {
 				buf := p.Get()
-				size := 1024 + ((j+i)%5)*2048
+				size := 1024 + ((j+id)%5)*2048
 				if buf.Cap() < size {
 					buf.Grow(size)
 				}
@@ -584,5 +585,52 @@ func TestNilOptionReceiver(t *testing.T) {
 	}
 	if *opt.CalibratePeriod != 100 {
 		t.Errorf("Expected CalibratePeriod 100, got %d", *opt.CalibratePeriod)
+	}
+}
+
+// =============================================================================
+// resize 缩容越界回归测试
+// =============================================================================
+
+// TestAdaptiveRingResizeShrink 回归：缩容时若空闲对象数超过新容量，
+// 旧实现会 newBuf[copyCount] 越界 panic；修复后应安全丢弃多余对象并保持队列不变量。
+func TestAdaptiveRingResizeShrink(t *testing.T) {
+	cases := []struct {
+		curCap, count, newCap int
+	}{
+		{512, 500, 409}, // 缩容丢弃多余
+		{512, 409, 409}, // 缩容恰好满
+		{512, 300, 409}, // 缩容部分
+		{512, 0, 32},    // 缩容空池
+		{32, 32, 512},   // 扩容满
+		{32, 10, 512},   // 扩容部分
+	}
+	for _, c := range cases {
+		p := &AdaptiveRingPool[*bytes.Buffer]{
+			buffer: make([]*bytes.Buffer, c.curCap),
+			minCap: 32, maxCap: 512, curCap: c.curCap,
+		}
+		p.head = 0
+		p.count = c.count
+		p.tail = c.count % c.curCap
+		for i := 0; i < c.count; i++ {
+			p.buffer[i] = &bytes.Buffer{}
+		}
+
+		p.resize(c.newCap)
+
+		wantCount := min(c.count, c.newCap)
+		if p.curCap != c.newCap || p.count != wantCount || p.head != 0 || p.tail != wantCount%c.newCap {
+			t.Fatalf("case %+v: curCap=%d count=%d head=%d tail=%d (wantCount=%d)",
+				c, p.curCap, p.count, p.head, p.tail, wantCount)
+		}
+		// 缩放后循环 Get/Put 不应 panic
+		for i := 0; i < p.count; i++ {
+			b := p.Get()
+			if b == nil {
+				t.Fatalf("case %+v: Get 返回 nil", c)
+			}
+			p.Put(b)
+		}
 	}
 }

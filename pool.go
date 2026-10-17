@@ -2,6 +2,8 @@ package buffer
 
 import (
 	"sync/atomic"
+
+	"golang.org/x/sys/cpu"
 )
 
 // -------------------------- 核心配置（个人项目无脑用默认值，不用改） --------------------------
@@ -20,36 +22,39 @@ const (
 )
 
 type AdaptiveRingPool[T any] struct {
+	_ cpu.CacheLinePad
 	// --------------- 第一缓存行：锁（x86_64热点，独占64字节）---------------
 	// SpinLock占4字节，填充60字节，刚好占满64字节缓存行
 	mu SpinLock
-	_  [60]byte // 64 - 4 = 60
+	_  cpu.CacheLinePad
 
 	// --------------- 第二缓存行：核心热点字段（head/tail/count）---------------
 	// int在x86_64是4字节，3个字段合计12字节，填充52字节占满64字节
-	head  int      // 取数位置（高频读写）
-	tail  int      // 放数位置（高频读写）
-	count int      // 空闲数（高频读写）
-	_     [52]byte // 64 - 3*4 = 52
+	head  int // 取数位置（高频读写）
+	tail  int // 放数位置（高频读写）
+	count int // 空闲数（高频读写）
+	_     cpu.CacheLinePad
 
 	// --------------- 第三缓存行：原子统计变量（x86_64原子操作需对齐）---------------
 	// atomic.Int64是8字节，2个字段合计16字节，填充48字节占满64字节
 	hitCount atomic.Int64 // 命中数（高频读，低频写）
 	getCount atomic.Int64 // 总获取数（高频写）
-	_        [48]byte     // 64 - 2*8 = 48
+	_        cpu.CacheLinePad
 
 	// --------------- 第四缓存行：容量控制字段（冷字段）---------------
 	// 3个int合计12字节，填充52字节占满64字节
-	minCap int      // 最小容量（几乎不修改）
-	maxCap int      // 最大容量（初始化后不变）
-	curCap int      // 当前容量（低频修改）
-	_      [52]byte // 64 - 3*4 = 52
+	minCap int // 最小容量（几乎不修改）
+	maxCap int // 最大容量（初始化后不变）
+	curCap int // 当前容量（低频修改）
+	_      cpu.CacheLinePad
 
 	// --------------- 第五缓存行：函数指针+缓冲区（最冷字段）---------------
 	// New（函数指针，8字节） + buffer（切片，24字节） = 32字节，填充32字节占满64字节
-	New    func() T // 创建函数（初始化后不变）
-	buffer []T      // 环形队列（低频大尺寸访问）
-	_      [32]byte // 64 - 8 - 24 = 32
+	New func() T // 创建函数（初始化后不变）
+	_   cpu.CacheLinePad
+
+	buffer []T // 环形队列（低频大尺寸访问）
+	_      cpu.CacheLinePad
 }
 
 // NewAdaptiveRingPool 创建自适应环形池，个人项目无脑用这个，默认配置足够
@@ -80,18 +85,18 @@ func (p *AdaptiveRingPool[T]) Get() T {
 	p.getCount.Add(1)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	// 2. 有空闲对象，复用，命中数+1
 	if p.count > 0 {
 		obj := p.buffer[p.head]
 		p.head = (p.head + 1) % p.curCap
 		p.count--
 		p.hitCount.Add(1)
+		p.mu.Unlock()
 		return obj
 	}
+	p.mu.Unlock()
 
-	// 3. 无空闲对象，新建
+	// 3. 无空闲对象，锁外新建，避免在自旋锁内做可能触发 GC 的分配
 	return p.New()
 }
 
@@ -112,7 +117,7 @@ func (p *AdaptiveRingPool[T]) Put(obj T) {
 	p.autoScale()
 }
 
-// autoScale 自动学习+扩容缩容核心逻辑，极简，无复杂计算，锁内执行，耗时可忽略
+// autoScale 自动学习+扩容缩容核心逻辑，必须在持有 p.mu 时调用。
 func (p *AdaptiveRingPool[T]) autoScale() {
 	// 总获取数为0，无需伸缩
 	total := p.getCount.Load()
@@ -142,7 +147,7 @@ func (p *AdaptiveRingPool[T]) autoScale() {
 	// 情况3：命中率适中，不做任何操作，维持当前容量
 }
 
-// resize 环形队列的扩容/缩容实现，最优写法，无内存浪费，性能极致
+// resize 环形队列的扩容/缩容实现，必须在持有 p.mu 时调用。
 func (p *AdaptiveRingPool[T]) resize(newCap int) {
 	if newCap == p.curCap {
 		return
@@ -150,18 +155,19 @@ func (p *AdaptiveRingPool[T]) resize(newCap int) {
 
 	// 新建新容量的数组
 	newBuf := make([]T, newCap)
-	// 把原队列中的空闲对象，按顺序拷贝到新数组，只拷贝有效数据，无浪费
-	copyCount := 0
-	for copyCount < p.count {
-		srcIdx := (p.head + copyCount) % p.curCap
-		newBuf[copyCount] = p.buffer[srcIdx]
-		copyCount++
+	// 把原队列中的空闲对象按顺序拷贝到新数组。
+	// 缩容时 newCap 可能小于当前空闲对象数：只拷贝放得下的，多余对象直接丢弃。
+	copyCount := min(p.count, newCap)
+	for i := 0; i < copyCount; i++ {
+		srcIdx := (p.head + i) % p.curCap
+		newBuf[i] = p.buffer[srcIdx]
 	}
 
-	// 更新队列状态，完成伸缩
+	// 更新队列状态，完成伸缩（count 必须同步为实际拷贝数，避免缩容后越界）
 	p.buffer = newBuf
 	p.head = 0
-	p.tail = p.count
+	p.tail = copyCount % newCap
+	p.count = copyCount
 	p.curCap = newCap
 
 	// 重置统计，开始新一轮的自动学习

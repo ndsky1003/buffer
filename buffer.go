@@ -1,4 +1,5 @@
-// 算法在工作，但“刹车”踩得太死（0.9），且“垃圾桶”口子开得太大（2.0），导致在短暂的测试周期内来不及清理历史库存。
+// Package buffer 提供基于环形队列 + EMA 校准的自适应 buffer 池，
+// 用于复用 *bytes.Buffer 与 []byte，避免频繁内存分配。
 package buffer
 
 import (
@@ -12,7 +13,7 @@ const (
 	emaUpFactor = 0.4
 
 	// emaDownFactor: 下跌时的平滑因子 (0~1)。
-	// 值越大，对历史越执着（跌得越慢）。0.9 代表保留 90% 历史，只接纳 10% 下跌。
+	// 值越大，对历史越执着（跌得越慢）。0.8 代表保留 80% 历史，只接纳 20% 下跌。
 	// 这有助于在流量波动时保持水位，避免频繁扩容。
 	emaDownFactor = 0.8
 
@@ -94,16 +95,18 @@ func (p *Pool[T]) Get() T {
 
 // Put 归还并智能处理
 func (p *Pool[T]) Put(b T) {
-	// if b == nil {
-	// 	return
-	// }
-
-	// 此时 buffer 已包含数据，Len 是实际使用量，Cap 是底层数组容量
-	// used := uint64(b.Len())
-	// capVal := uint64(b.Cap())
-	used, capVal := p.statFunc(b) // ==nil cap 返回0
+	// statFunc 返回 (used, cap)：
+	//   used —— 实际使用量 (Len)，用于校准水位；
+	//   cap  —— 底层分配容量 (Cap)，用于丢弃判决。
+	used, capVal := p.statFunc(b) // b == nil 时 cap 返回 0
 	if capVal == 0 {
 		return
+	}
+
+	// 关键修复：只 Grow 不 Write（或零写入）时 Len 为 0，但用户确实需要 capVal 的容量。
+	// 此时以 Cap 作为实际需求，避免池子把“预分配”误判为空包而忽略扩容。
+	if used == 0 {
+		used = capVal
 	}
 
 	// 1. 智能采样更新 maxUsage (性能优化核心)
