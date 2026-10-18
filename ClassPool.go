@@ -74,7 +74,7 @@ func newClassPool[T any](
 	opt := Options().Merge(opts...)
 	opt.SetMinSize(minS)
 	opt.SetMaxSize(maxS)
-	return New(makeFunc, resetFunc, statFunc, &opt)
+	return NewPool(makeFunc, resetFunc, statFunc, &opt)
 }
 
 // Get 按期望大小 size 选择对应档位。

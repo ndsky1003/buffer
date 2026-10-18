@@ -4,7 +4,7 @@ import "bytes"
 
 // NewBufferPool 创建 *bytes.Buffer 专用池
 func NewBufferPool(opts ...*Option) *Pool[*bytes.Buffer] {
-	return New(
+	return NewPool(
 		// make
 		func(size uint64) *bytes.Buffer {
 			return bytes.NewBuffer(make([]byte, 0, size))
@@ -27,7 +27,7 @@ func NewBufferPool(opts ...*Option) *Pool[*bytes.Buffer] {
 
 // NewBytePool 创建 []byte 专用池
 func NewBytePool(opts ...*Option) *Pool[[]byte] {
-	return New(
+	return NewPool(
 		// make: 直接 make slice
 		func(size uint64) []byte {
 			return make([]byte, 0, size)

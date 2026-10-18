@@ -47,15 +47,16 @@ type Pool[T any] struct {
 	_ padding // 隔离只读区和读写区
 
 	// 2. 运行时状态 (高频读写，原子操作)
-	calls        uint64
-	_            padding // 隔离 calls 和 maxUsage
-	maxUsage     uint64  //校准区间的最大使用者,是多少
-	_            padding // 隔离 maxUsage 和 calibratedSz
-	calibratedSz uint64  //校准值，最新分配的大小
+	calls        atomic.Uint64
+	_            padding       // 隔离 calls 和 maxUsage
+	maxUsage     atomic.Uint64 // 校准区间的最大使用者
+	_            padding       // 隔离 maxUsage 和 calibratedSz
+	calibratedSz atomic.Uint64 // 校准值，最新分配的大小
 }
 
-// New 创建一个新的智能池
-func New[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (uint64, uint64), opts ...*Option) *Pool[T] {
+// NewPool 创建一个新的智能池。
+// 三个适配函数 makeFunc/resetFunc/statFunc 抽象了 *bytes.Buffer 与 []byte 等类型的差异。
+func NewPool[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (uint64, uint64), opts ...*Option) *Pool[T] {
 	opt := Options().
 		SetMinSize(512).          // 最小不小于 512B
 		SetMaxSize(64 << 20).     // 最大不超过 64MB (防止 OOM) 64<< 10 是64k
@@ -69,18 +70,17 @@ func New[T any](makeFunc func(uint64) T, resetFunc func(T) T, statFunc func(T) (
 		maxSize:         *opt.MaxSize,
 		calibratePeriod: *opt.CalibratePeriod,
 		maxPercent:      *opt.MaxPercent,
-		calibratedSz:    *opt.CalibratedSz, // 初始猜测值
 		makeFunc:        makeFunc,
 		resetFunc:       resetFunc,
 		statFunc:        statFunc,
 	}
 
 	// 确保初始值合法
-	p.calibratedSz = max(p.minSize, p.calibratedSz)
+	p.calibratedSz.Store(max(p.minSize, *opt.CalibratedSz))
 
 	p.pool.New = func() T {
 		// 原子读取当前的校准大小
-		size := atomic.LoadUint64(&p.calibratedSz)
+		size := p.calibratedSz.Load()
 		return p.makeFunc(size)
 	}
 
@@ -112,9 +112,9 @@ func (p *Pool[T]) Put(b T) {
 	// 1. 智能采样更新 maxUsage (性能优化核心)
 	// 不要每次 Put 都去 CAS 抢锁。
 	// 策略：如果流量突增(used > current)，必须记录；否则低概率采样记录。
-	currentSz := atomic.LoadUint64(&p.calibratedSz)
+	currentSz := p.calibratedSz.Load()
 	shouldRecord := false
-	newCalls := atomic.AddUint64(&p.calls, 1)
+	newCalls := p.calls.Add(1)
 
 	if used > currentSz {
 		// 流量突增，必须记录，防止下一轮分配过小
@@ -134,12 +134,12 @@ func (p *Pool[T]) Put(b T) {
 
 	if shouldRecord {
 		for {
-			oldMax := atomic.LoadUint64(&p.maxUsage)
+			oldMax := p.maxUsage.Load()
 			if used <= oldMax {
 				break
 			}
 			// CAS 乐观锁更新
-			if atomic.CompareAndSwapUint64(&p.maxUsage, oldMax, used) {
+			if p.maxUsage.CompareAndSwap(oldMax, used) {
 				break
 			}
 		}
@@ -148,9 +148,9 @@ func (p *Pool[T]) Put(b T) {
 	// 2. 触发校准 (原子计数器)
 	if newCalls >= p.calibratePeriod {
 		// 只有获得重置权的那个 goroutine 去执行 calibrate
-		if atomic.CompareAndSwapUint64(&p.calls, newCalls, 0) {
+		if p.calls.CompareAndSwap(newCalls, 0) {
 			p.calibrate()
-			currentSz = atomic.LoadUint64(&p.calibratedSz)
+			currentSz = p.calibratedSz.Load()
 		}
 	}
 
@@ -171,8 +171,8 @@ func (p *Pool[T]) Put(b T) {
 // 此方法在单独的 goroutine 或低频路径执行，不需要极度优化，重在算法逻辑
 func (p *Pool[T]) calibrate() {
 	// 1. 获取并重置本周期的最大使用量
-	newMax := atomic.LoadUint64(&p.maxUsage)
-	atomic.StoreUint64(&p.maxUsage, 0)
+	newMax := p.maxUsage.Load()
+	p.maxUsage.Store(0)
 
 	// 2. 只有当本周期有有效数据时才调整
 	if newMax == 0 {
@@ -185,7 +185,7 @@ func (p *Pool[T]) calibrate() {
 	newMax = min(newMax, p.maxSize)
 
 	// 4. 读取旧的校准值
-	oldSz := atomic.LoadUint64(&p.calibratedSz)
+	oldSz := p.calibratedSz.Load()
 
 	// 5. EMA (指数加权移动平均) 算法 - 快涨慢跌
 	var nextSz uint64
@@ -212,5 +212,5 @@ func (p *Pool[T]) calibrate() {
 	nextSz = min(nextSz, p.maxSize)
 
 	// 7. 原子更新最终值
-	atomic.StoreUint64(&p.calibratedSz, nextSz)
+	p.calibratedSz.Store(nextSz)
 }

@@ -13,6 +13,82 @@
 - **泛型**：`*bytes.Buffer` 与 `[]byte` 开箱即用，也可自定义类型
 - **无第三方依赖**
 
+## 架构
+
+各类型的依赖关系（上层组合/依赖下层）：
+
+```
+应用层（调用方 Get/Put）
+│
+├── Pool[T]                单池：EMA 校准 + 智能丢弃
+│   └── AdaptiveRingPool[T]    底层存储：自适应伸缩环形队列
+│       └── SpinLock               自旋锁
+│
+├── ShardedPool[T]         分片池：高并发吞吐扩展
+│   └── Pool[T] × N            按 key 路由到 N 个独立 Pool
+│       └── AdaptiveRingPool[T]
+│           └── SpinLock
+│
+├── ClassPool[T]           分级池：多峰流量按 size 分档
+│   └── Pool[T] × N            按 size 路由到 N 个独立 Pool
+│       └── AdaptiveRingPool[T]
+│           └── SpinLock
+│
+└── FixedRingPool[T]       固定容量：满时覆盖最旧，热路径最短
+    └── SpinLock
+```
+
+各层职责：
+
+| 类型 | 职责 | 适用场景 |
+|---|---|---|
+| `SpinLock` | 自旋锁，短临界区下比 `sync.Mutex` 快 2~2.6 倍 | 底层基础设施 |
+| `AdaptiveRingPool[T]` | 环形队列，按命中率伸缩容量（miss 多扩容、hit 多缩容） | `Pool` 的默认存储 |
+| `FixedRingPool[T]` | 环形队列，容量固定、满时覆盖最旧，无伸缩统计 | 容量可预知、追求极致吞吐 |
+| `Pool[T]` | 核心池，EMA 校准 buffer 大小 + 智能丢弃 | 单峰流量、低到中并发 |
+| `ShardedPool[T]` | 分片池，组合 N 个 `Pool` 按 key 路由 | 高并发（游戏服、网关） |
+| `ClassPool[T]` | 分级池，组合 N 个 `Pool` 按 size 路由 | 多峰流量（2KB 与 2MB 并存） |
+
+## 性能
+
+> 测试环境：Apple M1（8 物理核），Go 1.21，负载 `Get → Write 1024B → Reset → Put`，全部 **0 分配**。
+
+### 各池吞吐（ns/op，越低越好）
+
+| 实现 | 单核 | 8 核 | 32 核 | 64 核 |
+|---|---|---|---|---|
+| `FixedRingPool` | 29.3 | 79.2 | 109 | 113 |
+| `AdaptiveRingPool` | 35.2 | 97.6 | 126 | 135 |
+| `Pool`（含 EMA） | 39.6 | 117 | 175 | 201 |
+
+换算 QPS（Mops/s = 1000 / ns）：
+
+| 实现 | 单核 | 64 核 |
+|---|---|---|
+| `FixedRingPool` | 34.1 | 8.9 |
+| `AdaptiveRingPool` | 28.4 | 7.4 |
+| `Pool` | 25.2 | 5.0 |
+
+### 分片扩展性（高并发场景）
+
+单 `Pool` 是单锁，多核争用下吞吐不升反降；`ShardedPool` 按 key 分片后吞吐随并发扩展：
+
+| 并发 | 单 `Pool` | `ShardedPool`（按 key） |
+|---|---|---|
+| 1 核 | 38.7 ns | 39.2 ns |
+| 8 核 | 119 ns | 34 ns |
+| 32 核 | 177 ns | 12.5 ns |
+| 64 核 | 187 ns | **10.0 ns** |
+
+### 锁选型依据（SpinLock vs sync.Mutex）
+
+| 并发 | SpinLock | sync.Mutex |
+|---|---|---|
+| 单核 | 33.9 ns | 40.3 ns |
+| 64 核 | 169 ns | 324 ns |
+
+自旋锁在「短临界区 + 高争用」下显著优于 `sync.Mutex`（多核争用快约 2 倍），这是环形队列选它的原因。
+
 ## 安装
 
 ```bash
@@ -104,6 +180,20 @@ defer cp.Put(buf)
 ```
 
 分界要落在两个峰之间、离峰至少 8~16 倍，避免 buffer 跨档。
+
+## 高并发：分片池
+
+单池是「一把自旋锁」，多核争用下吞吐不升反降（约 25 Mops/s 单核、争用后降到 5~8 Mops/s）。高并发场景（游戏服、网关）用**分片池**，把锁争用分散到多个分片，吞吐随分片数扩展：
+
+```go
+sp := buffer.NewShardedBufferPool(0) // 0 = 默认按 CPU 核数分片
+
+shardKey := hash(connID) // 用连接 ID 等稳定标识做 key
+buf := sp.Get(shardKey)
+defer sp.Put(shardKey, buf)
+```
+
+**关键**：`Get`/`Put` 必须传**同一个 key**（如同一连接的标识），对象才会始终回到同一分片、不跨分片漂移。分片后多核吞吐可提升 10 倍以上。
 
 ## 工作原理
 

@@ -27,7 +27,7 @@ go test -bench .                  # 基准测试
 - `resetFunc(v)`：归还前重置（`bytes.Buffer.Reset` / slice 的 `b[:0]`）
 - `statFunc(v)`：返回 `(used, cap)`，即实际使用量（`Len`）与底层容量（`Cap`）
 
-`Pool[T]` 的 EMA 校准（`buffer.go`）：
+`Pool[T]` 的 EMA 校准（`pool.go`）：
 
 - `emaUpFactor = 0.4`（涨得快）、`emaDownFactor = 0.8`（跌得慢）、`premiumFactor = 1.05`（额外 5% 余量）
 - 每 `calibratePeriod` 次 Put 校准一次（默认 1000）
@@ -45,11 +45,12 @@ go test -bench .                  # 基准测试
 
 ## 结构
 
-- `buffer.go` — 核心 `Pool[T]`：EMA 校准 + 智能丢弃。
+- `pool.go` — 核心 `Pool[T]`：EMA 校准 + 智能丢弃。
 - `api.go` — `NewBufferPool` / `NewBytePool` 便捷构造函数。
 - `option.go` — `Options()` builder（`SetMinSize/SetMaxSize/SetMaxPercent/SetCalibratePeriod/SetCalibratedSz`），方法对 nil 接收者安全，可链式调用。
 - `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：自旋锁 + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
 - `FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。
+- `ShardedPool.go` — `ShardedPool[T]` 分片池：按 key 分散到多个内层 Pool，避免单锁争用、吞吐随分片数扩展。注意须用**显式 key**（Get/Put 传同一 key），对象才不跨分片漂移；不要用轮询/随机路由（会导致漂移和额外分配）。
 - `SpinLock.go` — 自旋锁实现。
 
 ## 公共 API
@@ -57,7 +58,7 @@ go test -bench .                  # 基准测试
 ```go
 buffer.NewBufferPool(opts ...*Option) // *Pool[*bytes.Buffer]
 buffer.NewBytePool(opts ...*Option)   // *Pool[[]byte]
-buffer.New(makeFunc, resetFunc, statFunc, opts ...) // 泛型构造
+buffer.NewPool(makeFunc, resetFunc, statFunc, opts ...) // 泛型构造
 pool.Get() / pool.Put(v)
 
 // 分级池：按对象大小自动归拢到不同水位（应对多峰流量，如 2KB 与 2MB 并存）
@@ -67,6 +68,10 @@ buffer.NewByteClassPool(boundaries []uint64, opts ...)   // *ClassPool[[]byte]
 // 自动分桶：按 2 的幂自动分级，无需指定分界，误差 ≤2×（推荐）
 buffer.NewBufferAutoClassPool(opts ...) // *ClassPool[*bytes.Buffer]
 buffer.NewByteAutoClassPool(opts ...)   // *ClassPool[[]byte]
+
+// 分片池：按 key 分散到多个内层 Pool，高并发下吞吐随分片数扩展
+buffer.NewShardedBufferPool(shardCount, opts ...) // *ShardedPool[*bytes.Buffer]，Get/Put 需传 key
+buffer.NewShardedBytePool(shardCount, opts ...)   // *ShardedPool[[]byte]
 ```
 
 默认配置（`New` 中）：`MinSize=512`、`MaxSize=64MB`、`CalibratePeriod=1000`、`MaxPercent=1.5`、`CalibratedSz=1024`。
