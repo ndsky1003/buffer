@@ -161,10 +161,10 @@ func (p *Pool[T]) Put(b T) {
 		return
 	}
 
-	// 必须 Reset 才能复用
-	// b.Reset()
-	p.resetFunc(b)
-	p.pool.Put(b)
+	// 必须 Reset 才能复用。
+	// 注意：必须用 resetFunc 的返回值归还——[]byte 的 resetFunc 是 b[:0]（返回 len=0 的新 slice header），
+	// 若忽略返回值，归还的仍是 len=原始长度的 slice，旧数据未被“清空”，下次 Get 复用时 len 不为 0。
+	p.pool.Put(p.resetFunc(b))
 }
 
 // calibrate 计算周期内新的基准大小 (核心算法)

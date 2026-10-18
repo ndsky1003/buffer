@@ -42,6 +42,9 @@ go test -bench .                  # 基准测试
 - **校准基准是 `Len`（实际使用量），不是 `Cap`**：`Put` 里 `used = Len`，仅当 `Len==0`（只 `Grow` 不 `Write`）时回退用 `Cap`。缩容靠 `Len`，所以测试/基准要验证「写不满→缩容」必须真实 `Write` 数据（只 `Grow` 会让 `Len` 全 0，走 `Cap` 回退，测不出缩容）。见 `simulation_test.go`。
 - **`AdaptiveRingPool` 伸缩方向别改反**：`autoScale` 是「命中率**低**（miss 多，池子不够用）→ **扩容**；命中率**高**（hit 多，池子过剩）→ **缩容**」。命中率 = `Get` 时池子有空闲对象的比例。曾因写成反的导致「单对象串行复用」无限扩容到 `maxCap`（见 `TestAdaptiveRingNoInfiniteGrow` 回归测试）。
 - `Put(nil)` 安全（`statFunc` 返回 cap 0，直接 return）。
+- **`resetFunc` 的返回值必须被使用**：`Pool.Put` 里要 `p.pool.Put(p.resetFunc(b))` 而非 `p.resetFunc(b); p.pool.Put(b)`。`[]byte` 的 resetFunc 是 `b[:0]`（返回 len=0 的**新 slice header**，并不原地改 `b`），忽略返回值会归还 len=原始长度的 slice → 下次 `Get` 复用时 `len != 0`、旧数据未清空（zero-copy 大忌）。`*bytes.Buffer` 的 `b.Reset()` 是原地修改所以看不出来，但 `[]byte` 池会踩坑。见 `sharded_autoclass_verify_test.go` 的 `TestShardedByteAutoClassPoolGetAndRoute`。
+- **`Get` 返回的 cap 是「复用 buffer 的实际 cap」，不是 `calibratedSz`**：`calibratedSz` 只在「新建 buffer」时决定 make 的 size；一旦 ring 里有了更大的 buffer，串行复用下 `Get` 恒返回历史最大 cap，看不到校准水位的涨跌。要验证 `calibratedSz` 收敛必须直接读字段（如 `shards[0].classes[i].pool.calibratedSz.Load()`），别用 `Get` 的 cap 断言。
+- **缩容靠 `used > minSize` 的采样（严格大于）**：写「恰好 == minSize」的数据不采样（`used > minSize` 为 false），水位不降；写「略大于 minSize」（如 2049 vs minSize 2048）才触发慢跌缩容。这是「保底水位」的设计，不是 bug，但测试缩容要用 `> minSize` 的量。
 
 ## 结构
 
@@ -51,6 +54,7 @@ go test -bench .                  # 基准测试
 - `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：自旋锁 + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
 - `FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。
 - `ShardedPool.go` — `ShardedPool[T]` 分片池：按 key 分散到多个内层 Pool，避免单锁争用、吞吐随分片数扩展。注意须用**显式 key**（Get/Put 传同一 key），对象才不跨分片漂移；不要用轮询/随机路由（会导致漂移和额外分配）。
+- `ShardedClassPool.go` — `ShardedClassPool[T]` 分片分级池：外层按 key 分片（高并发）、内层每片一个 `ClassPool` 按 size 分档（多峰流量）。`Get(key, size)` / `Put(key, v)`，key 语义同 ShardedPool。
 - `SpinLock.go` — 自旋锁实现。
 
 ## 公共 API
@@ -72,6 +76,12 @@ buffer.NewByteAutoClassPool(opts ...)   // *ClassPool[[]byte]
 // 分片池：按 key 分散到多个内层 Pool，高并发下吞吐随分片数扩展
 buffer.NewShardedBufferPool(shardCount, opts ...) // *ShardedPool[*bytes.Buffer]，Get/Put 需传 key
 buffer.NewShardedBytePool(shardCount, opts ...)   // *ShardedPool[[]byte]
+
+// 分片分级池：外层按 key 分片、内层按 size 分档（高并发 + 多峰流量，如 RPC 网络库）
+buffer.NewShardedBufferClassPool(shardCount, boundaries, opts ...) // *ShardedClassPool[*bytes.Buffer]，Get(key,size)/Put(key,v)
+buffer.NewShardedByteClassPool(shardCount, boundaries, opts ...)   // *ShardedClassPool[[]byte]
+buffer.NewShardedBufferAutoClassPool(shardCount, opts ...) // 按 2 的幂自动分桶
+buffer.NewShardedByteAutoClassPool(shardCount, opts ...)
 ```
 
 默认配置（`New` 中）：`MinSize=512`、`MaxSize=64MB`、`CalibratePeriod=1000`、`MaxPercent=1.5`、`CalibratedSz=1024`。
@@ -84,6 +94,10 @@ buffer.NewShardedBytePool(shardCount, opts ...)   // *ShardedPool[[]byte]
 - `NewBufferAutoClassPool(...)`：按 2 的幂自动分桶（512B、1K、2K、4K…），无需指定分界；`Get(size)` 会把 size 向上取整到 2 的幂再选桶，`Put` 按实际容量归拢，误差 ≤2×。多峰流量首选这个。
 
 两个 API 都是 `Get(size)` 按期望大小选档、`Put` 按实际容量归拢。
+
+## 高并发 + 多峰流量：用 ShardedClassPool
+
+`ShardedPool` 解决高并发（分片、免单锁争用），`ClassPool` 解决多峰流量（分档、免水位被拉高）。两者叠加的场景（如 RPC 网络库：每连接并发处理，且既有小的心跳包又有大的 payload）用 `ShardedClassPool`：外层按 key 分片、内层每片一个 `ClassPool` 按 size 分档。API 为 `Get(key, size)` / `Put(key, v)`，key 语义同 ShardedPool（须显式稳定 key，如连接 ID 的哈希）。
 
 ## 约定
 

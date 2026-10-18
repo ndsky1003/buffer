@@ -138,10 +138,7 @@ func TestClassPoolConcurrent(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < 2000; i++ {
-				size := uint64(1 + ((i + id) % 4) * 512 << 10) // 混合大小
-				if size == 0 {
-					size = 512
-				}
+				size := uint64(1 << ((i + id) % 16)) // 1B ~ 32KB 混合大小
 				b := cp.Get(size)
 				if uint64(b.Cap()) < size {
 					b.Grow(int(size))

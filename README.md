@@ -34,6 +34,12 @@
 │       └── AdaptiveRingPool[T]
 │           └── SpinLock
 │
+├── ShardedClassPool[T]    分片分级池：高并发 + 多峰流量
+│   └── ClassPool[T] × N       按 key 路由到 N 个独立 ClassPool
+│       └── Pool[T] × M            按 size 路由到 M 个独立 Pool
+│           └── AdaptiveRingPool[T]
+│               └── SpinLock
+│
 └── FixedRingPool[T]       固定容量：满时覆盖最旧，热路径最短
     └── SpinLock
 ```
@@ -48,6 +54,7 @@
 | `Pool[T]` | 核心池，EMA 校准 buffer 大小 + 智能丢弃 | 单峰流量、低到中并发 |
 | `ShardedPool[T]` | 分片池，组合 N 个 `Pool` 按 key 路由 | 高并发（游戏服、网关） |
 | `ClassPool[T]` | 分级池，组合 N 个 `Pool` 按 size 路由 | 多峰流量（2KB 与 2MB 并存） |
+| `ShardedClassPool[T]` | 分片分级池，组合 N 个 `ClassPool` 按 key 路由、每片再按 size 分档 | 高并发 + 多峰流量（RPC 网络库） |
 
 ## 性能
 
@@ -194,6 +201,20 @@ defer sp.Put(shardKey, buf)
 ```
 
 **关键**：`Get`/`Put` 必须传**同一个 key**（如同一连接的标识），对象才会始终回到同一分片、不跨分片漂移。分片后多核吞吐可提升 10 倍以上。
+
+## 高并发 + 多峰流量：分片分级池
+
+当两种需求叠加（典型如 RPC 网络库：每连接并发处理，且既有小的心跳包又有大的 payload）时，用**分片分级池**——外层按 key 分片、内层每片按 size 分档：
+
+```go
+sp := buffer.NewShardedByteAutoClassPool(0) // 0 = 默认按 CPU 核数分片
+
+shardKey := hash(connID)
+buf := sp.Get(shardKey, uint64(payloadSize)) // 按 key 选分片、按 size 选桶
+defer sp.Put(shardKey, buf)
+```
+
+`Get(key, size)` / `Put(key, v)` 的 key 语义与分片池一致（须稳定，如连接 ID 的哈希）；`size` 语义与分级池一致（期望大小，自动分桶时向上取整到 2 的幂）。也支持手动分界 `NewShardedByteClassPool(shardCount, boundaries)`。
 
 ## 工作原理
 
