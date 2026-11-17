@@ -1,5 +1,7 @@
 package buffer
 
+import "sync"
+
 // FixedRingPool 固定容量的环形对象池。
 //
 // 与 AdaptiveRingPool 的区别：容量固定、不伸缩、无命中率统计，
@@ -9,13 +11,13 @@ package buffer
 // 有助于复用大容量 buffer、减少 grow。
 // 适用于容量可预先确定、追求极致吞吐的场景。
 type FixedRingPool[T any] struct {
-	mu       SpinLock // 锁
-	head     int      // 取数位置
-	tail     int      // 放数位置
-	count    int      // 空闲数
-	capacity int      // 固定容量
-	New      func() T // 创建函数（池空时调用）
-	buffer   []T      // 环形队列
+	mu       sync.Mutex // 锁
+	head     int        // 取数位置
+	tail     int        // 放数位置
+	count    int        // 空闲数
+	capacity int        // 固定容量
+	new      func() T   // 创建函数（池空时调用）
+	buffer   []T        // 环形队列
 }
 
 // NewFixedRingPool 创建固定容量的环形对象池。
@@ -26,7 +28,7 @@ func NewFixedRingPool[T any](capacity int, newFunc func() T) *FixedRingPool[T] {
 	return &FixedRingPool[T]{
 		capacity: capacity,
 		buffer:   make([]T, capacity),
-		New:      newFunc,
+		new:      newFunc,
 	}
 }
 
@@ -41,7 +43,7 @@ func (p *FixedRingPool[T]) Get() T {
 		return obj
 	}
 	p.mu.Unlock()
-	return p.New()
+	return p.new()
 }
 
 // Put 归还对象：队列未满则放回；已满则覆盖最旧的对象（淘汰 head，保持池子始终为最新状态）。

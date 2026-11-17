@@ -35,7 +35,9 @@ go test -bench .                  # 基准测试
 
 `AdaptiveRingPool[T]`（`AdaptiveRingPool.go`）：自旋锁保护的环形队列，按命中率自适应扩容/缩容。字段**紧凑排列**——锁已串行化访问，实测缓存行填充反而破坏局部性、降低吞吐（多核下慢 1.3~1.7×）。
 
-`FixedRingPool[T]`（`FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（而非丢弃），保持池子为最新对象。适合容量可预先确定、追求极致吞吐的场景。
+`FixedRingPool[T]`（`FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（而非丢弃），保持池子为最新对象。锁用 `sync.Mutex`（临界区更短、以单 goroutine/低争用为主，实测比自旋锁略快约 8%）。适合容量可预先确定、追求极致吞吐的场景。
+
+`ShardedFixedRingPool[T]`（`ShardedFixedRingPool.go`）：在 `FixedRingPool` 基础上按 key 分片（外层分片、内层每片一个 `FixedRingPool`），解决单锁串行化 + 缓存行伪共享导致的并发暴跌——实测并发吞吐从 ~195ns/op 降到 ~9ns/op（约 21 倍，超过单 goroutine 的 15ns/op）。无校准、无 reset，`Get` 复用对象须自行 reset。
 
 ## 关键陷阱
 
@@ -45,6 +47,7 @@ go test -bench .                  # 基准测试
 - **`resetFunc` 的返回值必须被使用**：`Pool.Put` 里要 `p.pool.Put(p.resetFunc(b))` 而非 `p.resetFunc(b); p.pool.Put(b)`。`[]byte` 的 resetFunc 是 `b[:0]`（返回 len=0 的**新 slice header**，并不原地改 `b`），忽略返回值会归还 len=原始长度的 slice → 下次 `Get` 复用时 `len != 0`、旧数据未清空（zero-copy 大忌）。`*bytes.Buffer` 的 `b.Reset()` 是原地修改所以看不出来，但 `[]byte` 池会踩坑。见 `sharded_autoclass_verify_test.go` 的 `TestShardedByteAutoClassPoolGetAndRoute`。
 - **`Get` 返回的 cap 是「复用 buffer 的实际 cap」，不是 `calibratedSz`**：`calibratedSz` 只在「新建 buffer」时决定 make 的 size；一旦 ring 里有了更大的 buffer，串行复用下 `Get` 恒返回历史最大 cap，看不到校准水位的涨跌。要验证 `calibratedSz` 收敛必须直接读字段（如 `shards[0].classes[i].pool.calibratedSz.Load()`），别用 `Get` 的 cap 断言。
 - **缩容靠 `used > minSize` 的采样（严格大于）**：写「恰好 == minSize」的数据不采样（`used > minSize` 为 false），水位不降；写「略大于 minSize」（如 2049 vs minSize 2048）才触发慢跌缩容。这是「保底水位」的设计，不是 bug，但测试缩容要用 `> minSize` 的量。
+- **`ShardedFixedRingPool` 无自动 reset**：内层 `FixedRingPool` 不做 reset，`Get` 复用的对象残留旧数据，须调用方自行清理——`*bytes.Buffer` 要 `Reset()`，`[]byte` 归还时传 `b[:0]`（否则下次 `Get` 的 slice `len != 0`，残留旧数据）。见 `ShardedFixedRingPool_test.go` 的 `TestShardedFixedRingPoolNoAutoReset`、`TestShardedFixedBytePoolReslice`。
 
 ## 结构
 
@@ -52,10 +55,12 @@ go test -bench .                  # 基准测试
 - `api.go` — `NewBufferPool` / `NewBytePool` 便捷构造函数。
 - `option.go` — `Options()` builder（`SetMinSize/SetMaxSize/SetMaxPercent/SetCalibratePeriod/SetCalibratedSz`），方法对 nil 接收者安全，可链式调用。
 - `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：自旋锁 + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
-- `FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。
+- `FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。锁用 `sync.Mutex`。
+- `ShardedFixedRingPool.go` — `ShardedFixedRingPool[T]` 分片固定容量池：外层按 key 分片、内层每片一个 `FixedRingPool`，高并发 + 容量可预知。
 - `ShardedPool.go` — `ShardedPool[T]` 分片池：按 key 分散到多个内层 Pool，避免单锁争用、吞吐随分片数扩展。注意须用**显式 key**（Get/Put 传同一 key），对象才不跨分片漂移；不要用轮询/随机路由（会导致漂移和额外分配）。
 - `ShardedClassPool.go` — `ShardedClassPool[T]` 分片分级池：外层按 key 分片（高并发）、内层每片一个 `ClassPool` 按 size 分档（多峰流量）。`Get(key, size)` / `Put(key, v)`，key 语义同 ShardedPool。
 - `SpinLock.go` — 自旋锁实现。
+- `hash.go` — `Hash(uint64) uint32` / `HashString(string) uint32`：分片 key 哈希（FNV-1a / 高低位混合）。
 
 ## 公共 API
 
@@ -77,11 +82,18 @@ buffer.NewByteAutoClassPool(opts ...)   // *ClassPool[[]byte]
 buffer.NewShardedBufferPool(shardCount, opts ...) // *ShardedPool[*bytes.Buffer]，Get/Put 需传 key
 buffer.NewShardedBytePool(shardCount, opts ...)   // *ShardedPool[[]byte]
 
+// 分片固定容量池：外层按 key 分片、内层每片一个 FixedRingPool（高并发 + 容量可预知）
+buffer.NewShardedFixedRingPool(shardCount, capacity, newFunc) // *ShardedFixedRingPool[T]，Get/Put 需传 key，key 为任意整型
+
 // 分片分级池：外层按 key 分片、内层按 size 分档（高并发 + 多峰流量，如 RPC 网络库）
 buffer.NewShardedBufferClassPool(shardCount, boundaries, opts ...) // *ShardedClassPool[*bytes.Buffer]，Get(key,size)/Put(key,v)
 buffer.NewShardedByteClassPool(shardCount, boundaries, opts ...)   // *ShardedClassPool[[]byte]
 buffer.NewShardedBufferAutoClassPool(shardCount, opts ...) // 按 2 的幂自动分桶
 buffer.NewShardedByteAutoClassPool(shardCount, opts ...)
+
+// 分片 key 哈希：把连接 ID / 会话 token 等稳定标识映射成 uint32 key
+buffer.Hash(uint64) uint32        // 整型 → 高低位混合
+buffer.HashString(string) uint32  // 字符串 → FNV-1a
 ```
 
 默认配置（`New` 中）：`MinSize=512`、`MaxSize=64MB`、`CalibratePeriod=1000`、`MaxPercent=1.5`、`CalibratedSz=1024`。

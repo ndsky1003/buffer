@@ -1,3 +1,3 @@
-module github.com/ndsky1003/buffer/v3
+module github.com/ndsky1003/buffer
 
-go 1.21
+go 1.27

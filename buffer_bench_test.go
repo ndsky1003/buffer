@@ -635,3 +635,109 @@ func TestQPSManual(t *testing.T) {
 		})
 	}
 }
+
+// =============================================================================
+// FixedRingPool QPS 压测
+// =============================================================================
+
+// BenchmarkFixedRingPoolGetPut 单 goroutine Get/Put（1KB 数据）
+func BenchmarkFixedRingPoolGetPut(b *testing.B) {
+	p := NewFixedRingPool(64, func() *bytes.Buffer { return bytes.NewBuffer(make([]byte, 0, 1024)) })
+	data := make([]byte, 1024)
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		buf := p.Get()
+		buf.Reset()
+		buf.Write(data)
+		p.Put(buf)
+	}
+}
+
+// BenchmarkFixedRingPoolParallel 并发 Get/Put（b.RunParallel，1KB 数据）
+func BenchmarkFixedRingPoolParallel(b *testing.B) {
+	p := NewFixedRingPool(1024, func() *bytes.Buffer { return bytes.NewBuffer(make([]byte, 0, 1024)) })
+	data := make([]byte, 1024)
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			buf := p.Get()
+			buf.Reset()
+			buf.Write(data)
+			p.Put(buf)
+		}
+	})
+}
+
+// BenchmarkMaxQPSFixedRingPool 极限 QPS 压测（并发，1KB 数据）
+func BenchmarkMaxQPSFixedRingPool(b *testing.B) {
+	p := NewFixedRingPool(1024, func() *bytes.Buffer { return bytes.NewBuffer(make([]byte, 0, 1024)) })
+	data := make([]byte, 1024)
+
+	// 预热
+	for i := 0; i < 10000; i++ {
+		buf := p.Get()
+		buf.Reset()
+		buf.Write(data)
+		p.Put(buf)
+	}
+
+	b.ResetTimer()
+	var ops uint64
+
+	workers := runtime.NumCPU() * 2
+	if workers < 4 {
+		workers = 4
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				buf := p.Get()
+				buf.Reset()
+				buf.Write(data)
+				p.Put(buf)
+				atomic.AddUint64(&ops, 1)
+			}
+		}()
+	}
+
+	close(start)
+	duration := 5 * time.Second
+	time.Sleep(duration)
+
+	b.StopTimer()
+	qps := float64(atomic.LoadUint64(&ops)) / duration.Seconds()
+	b.ReportMetric(qps/1e6, "Mops/s")
+}
+
+// BenchmarkShardedFixedRingPoolParallel 分片固定容量池并发 Get/Put（b.RunParallel，1KB 数据）
+// 每个 goroutine 分配独立 key，模拟「每连接一个分片」的真实高并发场景。
+func BenchmarkShardedFixedRingPoolParallel(b *testing.B) {
+	sp := NewShardedFixedRingPool(0, 64, func() *bytes.Buffer {
+		return bytes.NewBuffer(make([]byte, 0, 1024))
+	})
+	data := make([]byte, 1024)
+	var keyCounter uint32
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		key := atomic.AddUint32(&keyCounter, 1)
+		for pb.Next() {
+			buf := sp.Get(key)
+			buf.Reset()
+			buf.Write(data)
+			sp.Put(key, buf)
+		}
+	})
+}

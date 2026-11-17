@@ -40,8 +40,12 @@
 │           └── AdaptiveRingPool[T]
 │               └── SpinLock
 │
-└── FixedRingPool[T]       固定容量：满时覆盖最旧，热路径最短
-    └── SpinLock
+├── FixedRingPool[T]       固定容量：满时覆盖最旧，热路径最短
+│   └── sync.Mutex
+│
+└── ShardedFixedRingPool[T]  分片固定容量：高并发 + 容量可预知
+    └── FixedRingPool[T] × N     按 key 路由到 N 个独立 FixedRingPool
+        └── sync.Mutex
 ```
 
 各层职责：
@@ -51,6 +55,7 @@
 | `SpinLock` | 自旋锁，短临界区下比 `sync.Mutex` 快 2~2.6 倍 | 底层基础设施 |
 | `AdaptiveRingPool[T]` | 环形队列，按命中率伸缩容量（miss 多扩容、hit 多缩容） | `Pool` 的默认存储 |
 | `FixedRingPool[T]` | 环形队列，容量固定、满时覆盖最旧，无伸缩统计 | 容量可预知、追求极致吞吐 |
+| `ShardedFixedRingPool[T]` | 分片固定容量池：按 key 路由到 N 个独立 `FixedRingPool` | 高并发 + 容量可预知 |
 | `Pool[T]` | 核心池，EMA 校准 buffer 大小 + 智能丢弃 | 单峰流量、低到中并发 |
 | `ShardedPool[T]` | 分片池，组合 N 个 `Pool` 按 key 路由 | 高并发（游戏服、网关） |
 | `ClassPool[T]` | 分级池，组合 N 个 `Pool` 按 size 路由 | 多峰流量（2KB 与 2MB 并存） |
@@ -94,7 +99,18 @@
 | 单核 | 33.9 ns | 40.3 ns |
 | 64 核 | 169 ns | 324 ns |
 
-自旋锁在「短临界区 + 高争用」下显著优于 `sync.Mutex`（多核争用快约 2 倍），这是环形队列选它的原因。
+自旋锁在「短临界区 + 高争用」下显著优于 `sync.Mutex`（多核争用快约 2 倍），这是 `AdaptiveRingPool` 选它的原因。而 `FixedRingPool` 的临界区更短、以单 goroutine/低争用为主，实测 `sync.Mutex` 略快（约 8%），故改用 `sync.Mutex`。
+
+### FixedRingPool 实测 QPS（Apple M4）
+
+> 测试环境：Apple M4（10 核），Go 1.27，负载 `Get → Reset → Write 1024B → Put`，0 分配。命令：`go test -bench 'BenchmarkFixedRingPool|BenchmarkShardedFixedRingPool' -benchtime=2s`。
+
+| 实现 | 单 goroutine（ns/op） | 并发 10 核（ns/op） |
+|---|---|---|
+| `FixedRingPool` | 15.0 | 191 |
+| `ShardedFixedRingPool` | — | **9.3** |
+
+单把锁串行化所有 Get/Put，`FixedRingPool` 并发争用下吞吐不升反降（约降 13 倍）；按 key 分片后（`ShardedFixedRingPool`）争用分散到各片，并发吞吐提升约 21 倍，甚至超过单 goroutine。
 
 ## 安装
 
@@ -195,12 +211,37 @@ defer cp.Put(buf)
 ```go
 sp := buffer.NewShardedBufferPool(0) // 0 = 默认按 CPU 核数分片
 
-shardKey := hash(connID) // 用连接 ID 等稳定标识做 key
+shardKey := buffer.Hash(uint64(connID)) // 用连接 ID 等稳定标识做 key
 buf := sp.Get(shardKey)
 defer sp.Put(shardKey, buf)
 ```
 
 **关键**：`Get`/`Put` 必须传**同一个 key**（如同一连接的标识），对象才会始终回到同一分片、不跨分片漂移。分片后多核吞吐可提升 10 倍以上。
+
+key 的计算用库内置的 `buffer.Hash`（整型）或 `buffer.HashString`（字符串）：
+
+```go
+shardKey := buffer.Hash(uint64(connID)) // 整型 ID（自增 ID、时间戳等）
+shardKey := buffer.HashString(sessionTok) // 字符串标识（会话 token、UUID 等）
+```
+
+若 `connID` 本身是自增整数，低位天然均匀，`uint32(connID)` 即可；哈希只是为了把「低位分布不均」的标识（如时间戳、字符串）打散。
+
+## 高并发 + 容量可预知：分片固定容量池
+
+如果容量能预先确定、且追求极致吞吐（不需要 EMA 校准），用 `ShardedFixedRingPool`——外层按 key 分片、内层每片一个固定容量 `FixedRingPool`：
+
+```go
+sp := buffer.NewShardedFixedRingPool(0, 64, func() *bytes.Buffer {
+	return bytes.NewBuffer(make([]byte, 0, 1024))
+}) // 分片数=CPU 核数、每片缓存 64 个、初始 1KB
+
+buf := sp.Get(connID) // key 为任意整型，内部取低 32 位路由
+buf.Reset() // 复用对象不自动 reset，须自行清理
+defer sp.Put(connID, buf)
+```
+
+与 `ShardedPool`（内层含 EMA 校准 + 自动 reset）的区别：本池无校准、无自动 reset，热路径更短，但调用方须负责 reset（`*bytes.Buffer` 用 `Reset()`，`[]byte` 归还时传 `b[:0]`）。`Get`/`Put` 的 key 为任意整型（`int64`、`int`、`uint32` 等），内部取低 32 位路由；若 key 低位分布不均（如时间戳），可先用 `buffer.Hash` 混合。
 
 ## 高并发 + 多峰流量：分片分级池
 
@@ -209,7 +250,7 @@ defer sp.Put(shardKey, buf)
 ```go
 sp := buffer.NewShardedByteAutoClassPool(0) // 0 = 默认按 CPU 核数分片
 
-shardKey := hash(connID)
+shardKey := buffer.Hash(uint64(connID))
 buf := sp.Get(shardKey, uint64(payloadSize)) // 按 key 选分片、按 size 选桶
 defer sp.Put(shardKey, buf)
 ```
