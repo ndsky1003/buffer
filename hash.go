@@ -25,7 +25,34 @@ func Hash(v uint64) uint32 {
 //	shardKey := buffer.HashString(sessionToken)
 //	buf := pool.Get(shardKey)
 func HashString(s string) uint32 {
-	h := fnv.New32a()
+	h := fnv.New32a() //分配在堆上，有gc问题
 	_, _ = h.Write([]byte(s))
 	return h.Sum32()
+}
+
+// NOTE: 下面2个版本没有gc逃逸问题
+func HashFNV32a(s string) uint32 {
+	const (
+		offset = 2166136261
+		prime  = 16777619
+	)
+	h := uint32(offset) // 普通uint32，纯栈，无任何堆分配
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime
+	}
+	return h
+}
+
+func HashFNV64a(s string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
 }

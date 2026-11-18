@@ -241,7 +241,23 @@ buf.Reset() // 复用对象不自动 reset，须自行清理
 defer sp.Put(connID, buf)
 ```
 
-与 `ShardedPool`（内层含 EMA 校准 + 自动 reset）的区别：本池无校准、无自动 reset，热路径更短，但调用方须负责 reset（`*bytes.Buffer` 用 `Reset()`，`[]byte` 归还时传 `b[:0]`）。`Get`/`Put` 的 key 为任意整型（`int64`、`int`、`uint32` 等），内部取低 32 位路由；若 key 低位分布不均（如时间戳），可先用 `buffer.Hash` 混合。
+与 `ShardedPool`（内层含 EMA 校准 + 自动 reset）的区别：本池无校准、无自动 reset，热路径更短，但调用方须负责 reset（`*bytes.Buffer` 用 `Reset()`，`[]byte` 归还时传 `b[:0]`）。`Get`/`Put` 的 key 为 `uint32`，取低 log2(分片数) 位路由；若 key 低位分布不均（如时间戳），可先用 `buffer.Hash` 混合。
+
+### 池化需要显式释放的资源：SetEvict
+
+`FixedRingPool` / `ShardedFixedRingPool` 满时会**覆盖最旧**，被淘汰的对象默认直接交给 GC。池化 `*bytes.Buffer`、`[]byte` 无所谓；但池化 fd、CGO 内存、mmap、下游连接、外部句柄这类**需要显式释放**的资源时，被淘汰的对象没人 `Close()` 就是资源泄漏。用 `SetEvict` 登记释放回调：
+
+```go
+pool := buffer.NewShardedFixedRingPool(0, 64, newUpstreamConn).
+	SetEvict(func(c *UpstreamConn) { c.Close() }) // 为所有分片登记；FixedRingPool 上同名方法，均返回自身可链式
+```
+
+回调语义：
+
+- 只在「池满被覆盖」时触发，且只会收到池内的**空闲**对象——已 `Get` 走、尚未归还的对象不会被淘汰（它们在槽位里残留的引用被覆盖时不触发）。
+- 在池锁**外**执行，因此回调里可以安全回用本池的 `Get`/`Put`，不会死锁；但回调运行在调用 `Put` 的那个 goroutine 上，别在里面做长阻塞操作。
+- 淘汰顺序是最旧优先，池内始终保留最新归还的对象。
+- 传 `nil` 清除回调。
 
 ## 高并发 + 多峰流量：分片分级池
 

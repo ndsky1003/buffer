@@ -2,12 +2,6 @@ package buffer
 
 import "runtime"
 
-// integer 约束所有有符号/无符号整型，用作分片 key 的类型约束。
-type integer interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 |
-		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
-}
-
 // ShardedFixedRingPool 分片固定容量池：外层按 key 分片，内层每片一个 FixedRingPool。
 // 兼具 FixedRingPool 的「极简热路径 + 固定容量 + 满时覆盖最旧」与分片的「争用随分片数下降」，
 // 适用于「高并发 + 容量可预先确定」的场景。
@@ -47,14 +41,33 @@ func NewShardedFixedRingPool[T any](shardCount, capacity int, newFunc func() T) 
 	return sp
 }
 
-// Get 取对象：按 key 路由到对应分片。key 可为任意整型（int64、int、uint32 等），
-// 内部取低 32 位路由（分片键语义，同 ShardedPool 的 uint32 key）。
+// Get 取对象：按 key 路由到对应分片（取 key 的低 log2(shardCount) 位，
+// 分片键语义同 ShardedPool 的 uint32 key）。
 // 若 key 低位分布不均（如时间戳），可先用 Hash 混合。返回的对象可能残留旧数据，调用方须自行 reset。
-func (sp *ShardedFixedRingPool[T]) Get(key string) T {
-	return sp.shards[int(HashString(key)&sp.mask)].Get()
+func (sp *ShardedFixedRingPool[T]) Get(key uint32) T {
+	return sp.shards[int(key&sp.mask)].Get()
 }
 
 // Put 归还对象：按 key 路由到对应分片（须与 Get 使用相同 key）。
-func (sp *ShardedFixedRingPool[T]) Put(key string, obj T) {
-	sp.shards[int(HashString(key)&sp.mask)].Put(obj)
+func (sp *ShardedFixedRingPool[T]) Put(key uint32, obj T) {
+	sp.shards[int(key&sp.mask)].Put(obj)
+}
+
+// SetEvict 为**所有分片**登记淘汰回调（语义同 FixedRingPool.SetEvict）。返回自身以便链式调用。
+//
+// 池化需要显式释放的资源（fd、CGO 内存、连接、外部句柄）时必须设置：
+// 每个分片有独立的 capacity，任一分片满时会覆盖最旧，
+// 被淘汰的对象若没有登记回调就会被直接丢弃 → 资源泄漏。
+//
+// 建议在开始并发使用前调用；运行期调用也安全（逐片加锁），
+// 但只影响此后被覆盖的对象。传 nil 清除回调。
+//
+// 典型用法（构造即登记）：
+//
+//	pool := NewShardedFixedRingPool(0, 64, newConn).SetEvict(func(c *Conn) { c.Close() })
+func (sp *ShardedFixedRingPool[T]) SetEvict(fn func(T)) *ShardedFixedRingPool[T] {
+	for _, shard := range sp.shards {
+		shard.SetEvict(fn)
+	}
+	return sp
 }

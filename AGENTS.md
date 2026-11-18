@@ -35,9 +35,9 @@ go test -bench .                  # 基准测试
 
 `AdaptiveRingPool[T]`（`AdaptiveRingPool.go`）：自旋锁保护的环形队列，按命中率自适应扩容/缩容。字段**紧凑排列**——锁已串行化访问，实测缓存行填充反而破坏局部性、降低吞吐（多核下慢 1.3~1.7×）。
 
-`FixedRingPool[T]`（`FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（而非丢弃），保持池子为最新对象。锁用 `sync.Mutex`（临界区更短、以单 goroutine/低争用为主，实测比自旋锁略快约 8%）。适合容量可预先确定、追求极致吞吐的场景。
+`FixedRingPool[T]`（`1.FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（丢弃最旧的、保留新归还的），保持池子为最新对象。锁用 `sync.Mutex`（临界区更短、以单 goroutine/低争用为主，实测比自旋锁略快约 8%）。适合容量可预先确定、追求极致吞吐的场景。`SetEvict(fn)` 登记淘汰回调，返回自身可链式（`NewFixedRingPool(cap, newFn).SetEvict(fn)`）。
 
-`ShardedFixedRingPool[T]`（`ShardedFixedRingPool.go`）：在 `FixedRingPool` 基础上按 key 分片（外层分片、内层每片一个 `FixedRingPool`），解决单锁串行化 + 缓存行伪共享导致的并发暴跌——实测并发吞吐从 ~195ns/op 降到 ~9ns/op（约 21 倍，超过单 goroutine 的 15ns/op）。无校准、无 reset，`Get` 复用对象须自行 reset。
+`ShardedFixedRingPool[T]`（`2.ShardedFixedRingPool.go`）：在 `FixedRingPool` 基础上按 `uint32` key 分片（外层分片、内层每片一个 `FixedRingPool`），解决单锁串行化 + 缓存行伪共享导致的并发暴跌——实测并发吞吐从 ~195ns/op 降到 ~9ns/op（约 21 倍，超过单 goroutine 的 15ns/op）。无校准、无 reset，`Get` 复用对象须自行 reset。`SetEvict(fn)` 传播到所有分片，返回自身可链式。
 
 ## 关键陷阱
 
@@ -48,6 +48,7 @@ go test -bench .                  # 基准测试
 - **`Get` 返回的 cap 是「复用 buffer 的实际 cap」，不是 `calibratedSz`**：`calibratedSz` 只在「新建 buffer」时决定 make 的 size；一旦 ring 里有了更大的 buffer，串行复用下 `Get` 恒返回历史最大 cap，看不到校准水位的涨跌。要验证 `calibratedSz` 收敛必须直接读字段（如 `shards[0].classes[i].pool.calibratedSz.Load()`），别用 `Get` 的 cap 断言。
 - **缩容靠 `used > minSize` 的采样（严格大于）**：写「恰好 == minSize」的数据不采样（`used > minSize` 为 false），水位不降；写「略大于 minSize」（如 2049 vs minSize 2048）才触发慢跌缩容。这是「保底水位」的设计，不是 bug，但测试缩容要用 `> minSize` 的量。
 - **`ShardedFixedRingPool` 无自动 reset**：内层 `FixedRingPool` 不做 reset，`Get` 复用的对象残留旧数据，须调用方自行清理——`*bytes.Buffer` 要 `Reset()`，`[]byte` 归还时传 `b[:0]`（否则下次 `Get` 的 slice `len != 0`，残留旧数据）。见 `ShardedFixedRingPool_test.go` 的 `TestShardedFixedRingPoolNoAutoReset`、`TestShardedFixedBytePoolReslice`。
+- **覆盖最旧会丢弃被淘汰对象 → 非 GC 资源必须 `SetEvict`**：`FixedRingPool.Put` 满时覆盖 head，旧对象默认直接交给 GC。池化 `*bytes.Buffer`/`[]byte` 无害；池化 fd、CGO 内存、连接、外部句柄时必须 `SetEvict(fn)` 登记释放回调（`ShardedFixedRingPool.SetEvict` 会传播到所有分片），否则资源泄漏。`evict` 必须在 `p.mu.Unlock()` **之后**调用（否则回调内回用 `Get`/`Put` 会死锁，见 `TestFixedRingPoolEvictMayReenterPool`）；`Put` 里要在锁内取 `p.evict` 快照，避免与 `SetEvict` 争用。evict 只会收到池内**空闲**对象，已 `Get` 走的不触发（见 `TestFixedRingPoolEvictSkipsInUseObject`）。
 
 ## 结构
 
@@ -55,8 +56,8 @@ go test -bench .                  # 基准测试
 - `api.go` — `NewBufferPool` / `NewBytePool` 便捷构造函数。
 - `option.go` — `Options()` builder（`SetMinSize/SetMaxSize/SetMaxPercent/SetCalibratePeriod/SetCalibratedSz`），方法对 nil 接收者安全，可链式调用。
 - `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：自旋锁 + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
-- `FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。锁用 `sync.Mutex`。
-- `ShardedFixedRingPool.go` — `ShardedFixedRingPool[T]` 分片固定容量池：外层按 key 分片、内层每片一个 `FixedRingPool`，高并发 + 容量可预知。
+- `1.FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。锁用 `sync.Mutex`。`SetEvict(fn)` 登记淘汰回调（池化非 GC 资源时必需）。
+- `2.ShardedFixedRingPool.go` — `ShardedFixedRingPool[T]` 分片固定容量池：外层按 key（`uint32`）分片、内层每片一个 `FixedRingPool`，高并发 + 容量可预知。`SetEvict(fn)` 传播到所有分片。
 - `ShardedPool.go` — `ShardedPool[T]` 分片池：按 key 分散到多个内层 Pool，避免单锁争用、吞吐随分片数扩展。注意须用**显式 key**（Get/Put 传同一 key），对象才不跨分片漂移；不要用轮询/随机路由（会导致漂移和额外分配）。
 - `ShardedClassPool.go` — `ShardedClassPool[T]` 分片分级池：外层按 key 分片（高并发）、内层每片一个 `ClassPool` 按 size 分档（多峰流量）。`Get(key, size)` / `Put(key, v)`，key 语义同 ShardedPool。
 - `SpinLock.go` — 自旋锁实现。
@@ -83,7 +84,11 @@ buffer.NewShardedBufferPool(shardCount, opts ...) // *ShardedPool[*bytes.Buffer]
 buffer.NewShardedBytePool(shardCount, opts ...)   // *ShardedPool[[]byte]
 
 // 分片固定容量池：外层按 key 分片、内层每片一个 FixedRingPool（高并发 + 容量可预知）
-buffer.NewShardedFixedRingPool(shardCount, capacity, newFunc) // *ShardedFixedRingPool[T]，Get/Put 需传 key，key 为任意整型
+buffer.NewShardedFixedRingPool(shardCount, capacity, newFunc) // *ShardedFixedRingPool[T]，Get/Put 需传 uint32 key
+// 淘汰回调：池满「覆盖最旧」时被淘汰的对象交给回调（池化 fd/连接/CGO 内存等非 GC 资源时必需）
+// 返回接收者自身，可链式：NewFixedRingPool(cap, newFn).SetEvict(fn)
+fixedRingPool.SetEvict(fn)      // FixedRingPool[T]，传 nil 清除
+sharded.SetEvict(fn)            // ShardedFixedRingPool[T]，传播到所有分片
 
 // 分片分级池：外层按 key 分片、内层按 size 分档（高并发 + 多峰流量，如 RPC 网络库）
 buffer.NewShardedBufferClassPool(shardCount, boundaries, opts ...) // *ShardedClassPool[*bytes.Buffer]，Get(key,size)/Put(key,v)

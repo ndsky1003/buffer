@@ -111,3 +111,79 @@ func TestShardedFixedRingPoolCapacityPerShard(t *testing.T) {
 		t.Fatalf("shard0.count=%d 期望 %d（固定容量）", sp.shards[0].count, cap)
 	}
 }
+
+// SetEvict 必须传播到所有分片：每片各自在满时淘汰，回调都能收到
+func TestShardedFixedRingPoolSetEvict(t *testing.T) {
+	sp := newTestBytePool(8, 2) // 8 片，每片 cap=2
+	var mu sync.Mutex
+	n := 0
+	sp.SetEvict(func(b []byte) {
+		if b == nil {
+			t.Error("evict 收到 nil 对象")
+		}
+		mu.Lock()
+		n++
+		mu.Unlock()
+	})
+
+	for i := 0; i < 10; i++ {
+		sp.Put(1, []byte("a")) // 同一分片，cap=2 → 淘汰 8 个
+	}
+	mu.Lock()
+	got := n
+	mu.Unlock()
+	if got != 8 {
+		t.Fatalf("淘汰 %d，期望 8（单片 cap=2、Put 10 个）", got)
+	}
+
+	for i := 0; i < 10; i++ {
+		sp.Put(2, []byte("b")) // 换 key → 另一分片，回调同样生效
+	}
+	mu.Lock()
+	got = n
+	mu.Unlock()
+	if got != 16 {
+		t.Fatalf("累计淘汰 %d，期望 16（SetEvict 须作用于所有分片）", got)
+	}
+}
+
+// SetEvict 返回自身：支持「构造即登记」的链式写法，且对所有分片生效
+func TestShardedFixedRingPoolSetEvictChaining(t *testing.T) {
+	n := 0
+	sp := NewShardedFixedRingPool(8, 2, func() *bytes.Buffer { return &bytes.Buffer{} }).
+		SetEvict(func(b *bytes.Buffer) { n++ })
+
+	for i := 0; i < 10; i++ {
+		sp.Put(1, &bytes.Buffer{}) // 分片 cap=2 → 淘汰 8 个
+	}
+	if n != 8 {
+		t.Fatalf("链式登记的回调未生效：淘汰 %d，期望 8", n)
+	}
+	if got := sp.SetEvict(nil); got != sp {
+		t.Fatal("SetEvict(nil) 应返回接收者自身")
+	}
+}
+
+// 分片池：已取出的对象不会被 evict（各片独立计数）
+func TestShardedFixedRingPoolEvictSkipsInUseObject(t *testing.T) {
+	sp := newTestBufPool(8, 2)
+	var evicted []*bytes.Buffer
+	sp.SetEvict(func(b *bytes.Buffer) { evicted = append(evicted, b) })
+
+	h1, h2, h3 := &bytes.Buffer{}, &bytes.Buffer{}, &bytes.Buffer{}
+	sp.Put(1, h1)
+	sp.Put(1, h2) // 该片满
+	inUse := sp.Get(1)
+	sp.Put(1, h3) // 未满：覆盖 h1 的残留槽位引用，不应淘汰
+	if len(evicted) != 0 {
+		t.Fatalf("未满时不应淘汰，实际 %d 个", len(evicted))
+	}
+	if inUse != h1 {
+		t.Fatal("Get 应取回 h1")
+	}
+	h4 := &bytes.Buffer{}
+	sp.Put(1, h4) // 满 → 淘汰空闲的 h2
+	if len(evicted) != 1 || evicted[0] != h2 {
+		t.Fatalf("淘汰 %v，期望仅 h2（使用中的对象不得被淘汰）", evicted)
+	}
+}
