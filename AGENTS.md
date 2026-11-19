@@ -2,10 +2,10 @@
 
 ## 概述
 
-高性能 buffer 池库：用环形队列（`AdaptiveRingPool`）+ 自旋锁替代 `sync.Pool`，通过 EMA 算法自适应调整 buffer 大小。Go 泛型（Go 1.21），支持 `*bytes.Buffer` 与 `[]byte`。
+高性能 buffer 池库：用环形队列（`AdaptiveRingPool`）+ `sync.Mutex` 替代 `sync.Pool`，通过 EMA 算法自适应调整 buffer 大小。Go 泛型（Go 1.21），支持 `*bytes.Buffer` 与 `[]byte`。
 
 - 模块路径：`github.com/ndsky1003/buffer/v3`（注意 `/v3` 后缀；包名为 `buffer`）
-- 无第三方依赖（无 `go.sum`）、无 CI、无 Makefile。
+- 依赖仅 `golang.org/x/sys`（`cpu.CacheLinePad`，SPSC 队列防伪共享用）、无 CI、无 Makefile。
 
 ## 常用命令
 
@@ -33,9 +33,9 @@ go test -bench .                  # 基准测试
 - 每 `calibratePeriod` 次 Put 校准一次（默认 1000）
 - 归还时若 `cap > calibratedSz * maxPercent` 直接丢弃交给 GC（防止超大 buffer 滞留）
 
-`AdaptiveRingPool[T]`（`AdaptiveRingPool.go`）：自旋锁保护的环形队列，按命中率自适应扩容/缩容。字段**紧凑排列**——锁已串行化访问，实测缓存行填充反而破坏局部性、降低吞吐（多核下慢 1.3~1.7×）。
+`AdaptiveRingPool[T]`（`AdaptiveRingPool.go`）：`sync.Mutex` 保护的环形队列，按命中率自适应扩容/缩容。字段**紧凑排列**——锁已串行化访问，实测缓存行填充反而破坏局部性、降低吞吐（多核下慢 1.3~1.7×）。
 
-`FixedRingPool[T]`（`1.FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（丢弃最旧的、保留新归还的），保持池子为最新对象。锁用 `sync.Mutex`（临界区更短、以单 goroutine/低争用为主，实测比自旋锁略快约 8%）。适合容量可预先确定、追求极致吞吐的场景。`SetEvict(fn)` 登记淘汰回调，返回自身可链式（`NewFixedRingPool(cap, newFn).SetEvict(fn)`）。
+`FixedRingPool[T]`（`1.FixedRingPool.go`）：固定容量的环形对象池，无伸缩、无命中率统计，热路径更短，实测比 `AdaptiveRingPool` 快约 17%~26%。队列满时**覆盖最旧**（丢弃最旧的、保留新归还的），保持池子为最新对象。锁用 `sync.Mutex`。适合容量可预先确定、追求极致吞吐的场景。`SetEvict(fn)` 登记淘汰回调，返回自身可链式（`NewFixedRingPool(cap, newFn).SetEvict(fn)`）。
 
 `ShardedFixedRingPool[T]`（`2.ShardedFixedRingPool.go`）：在 `FixedRingPool` 基础上按 `uint32` key 分片（外层分片、内层每片一个 `FixedRingPool`），解决单锁串行化 + 缓存行伪共享导致的并发暴跌——实测并发吞吐从 ~195ns/op 降到 ~9ns/op（约 21 倍，超过单 goroutine 的 15ns/op）。无校准、无 reset，`Get` 复用对象须自行 reset。`SetEvict(fn)` 传播到所有分片，返回自身可链式。
 
@@ -49,19 +49,20 @@ go test -bench .                  # 基准测试
 - **缩容靠 `used > minSize` 的采样（严格大于）**：写「恰好 == minSize」的数据不采样（`used > minSize` 为 false），水位不降；写「略大于 minSize」（如 2049 vs minSize 2048）才触发慢跌缩容。这是「保底水位」的设计，不是 bug，但测试缩容要用 `> minSize` 的量。
 - **`ShardedFixedRingPool` 无自动 reset**：内层 `FixedRingPool` 不做 reset，`Get` 复用的对象残留旧数据，须调用方自行清理——`*bytes.Buffer` 要 `Reset()`，`[]byte` 归还时传 `b[:0]`（否则下次 `Get` 的 slice `len != 0`，残留旧数据）。见 `ShardedFixedRingPool_test.go` 的 `TestShardedFixedRingPoolNoAutoReset`、`TestShardedFixedBytePoolReslice`。
 - **覆盖最旧会丢弃被淘汰对象 → 非 GC 资源必须 `SetEvict`**：`FixedRingPool.Put` 满时覆盖 head，旧对象默认直接交给 GC。池化 `*bytes.Buffer`/`[]byte` 无害；池化 fd、CGO 内存、连接、外部句柄时必须 `SetEvict(fn)` 登记释放回调（`ShardedFixedRingPool.SetEvict` 会传播到所有分片），否则资源泄漏。`evict` 必须在 `p.mu.Unlock()` **之后**调用（否则回调内回用 `Get`/`Put` 会死锁，见 `TestFixedRingPoolEvictMayReenterPool`）；`Put` 里要在锁内取 `p.evict` 快照，避免与 `SetEvict` 争用。evict 只会收到池内**空闲**对象，已 `Get` 走的不触发（见 `TestFixedRingPoolEvictSkipsInUseObject`）。
+- **SPSC 队列「先读槽位、后发布 r」的顺序不能反**：`SpinSPSCQueue.Dequeue` 必须先 `item := slots[idx]`（并 `slots[idx]=nil`），**再** `atomic.Store(&q.r, r+1)`。若反过来（先推进 r 再读槽位，比如用 `CompareAndSwapUint64(&q.r,...)` 抢下标），生产者会看到 r 已前进、在回绕时覆盖正在被读的槽位 → 数据竞争（读到错数据）。出队后 `slots[idx]=nil` 必须在 `Store(r)` 之前做，否则 nil 写与生产者的回绕覆盖竞争。见 `TestSpinSPSCQueueFIFOConcurrent`（`-race` 下捕获）。此外：`w`/`r` 的原子读写必须保留（跨 goroutine 的同步边），但生产者读自己的 `w`、消费者读自己的 `r` 可用普通读（单写者）。
 
 ## 结构
 
 - `pool.go` — 核心 `Pool[T]`：EMA 校准 + 智能丢弃。
 - `api.go` — `NewBufferPool` / `NewBytePool` 便捷构造函数。
 - `option.go` — `Options()` builder（`SetMinSize/SetMaxSize/SetMaxPercent/SetCalibratePeriod/SetCalibratedSz`），方法对 nil 接收者安全，可链式调用。
-- `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：自旋锁 + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
+- `AdaptiveRingPool.go` — `AdaptiveRingPool[T]` 环形队列：`sync.Mutex` + 自适应扩容/缩容（紧凑排列，无缓存行填充）。
 - `1.FixedRingPool.go` — `FixedRingPool[T]` 固定容量环形对象池：无伸缩、无统计，满时覆盖最旧，热路径更短。锁用 `sync.Mutex`。`SetEvict(fn)` 登记淘汰回调（池化非 GC 资源时必需）。
 - `2.ShardedFixedRingPool.go` — `ShardedFixedRingPool[T]` 分片固定容量池：外层按 key（`uint32`）分片、内层每片一个 `FixedRingPool`，高并发 + 容量可预知。`SetEvict(fn)` 传播到所有分片。
 - `ShardedPool.go` — `ShardedPool[T]` 分片池：按 key 分散到多个内层 Pool，避免单锁争用、吞吐随分片数扩展。注意须用**显式 key**（Get/Put 传同一 key），对象才不跨分片漂移；不要用轮询/随机路由（会导致漂移和额外分配）。
 - `ShardedClassPool.go` — `ShardedClassPool[T]` 分片分级池：外层按 key 分片（高并发）、内层每片一个 `ClassPool` 按 size 分档（多峰流量）。`Get(key, size)` / `Put(key, v)`，key 语义同 ShardedPool。
-- `SpinLock.go` — 自旋锁实现。
 - `hash.go` — `Hash(uint64) uint32` / `HashString(string) uint32`：分片 key 哈希（FNV-1a / 高低位混合）。
+- `0.SpinSPSCQueue.go` — `SpinSPSCQueue[T]` 无锁 SPSC 环形队列：**严格单生产者单消费者**、无锁无信号量，`slots []*T` 存指针（避免拷贝大 T）。w/r 单调下标用 `&mask` 取槽位，w 与 r 之间用 `cpu.CacheLinePad`（`golang.org/x/sys/cpu`）隔缓存行（防伪共享）。`Close()` 后 Enqueue 拒绝、Dequeue 排空返回 nil。含 `SpinSPSCQueue_test.go`。
 
 ## 公共 API
 
@@ -89,6 +90,13 @@ buffer.NewShardedFixedRingPool(shardCount, capacity, newFunc) // *ShardedFixedRi
 // 返回接收者自身，可链式：NewFixedRingPool(cap, newFn).SetEvict(fn)
 fixedRingPool.SetEvict(fn)      // FixedRingPool[T]，传 nil 清除
 sharded.SetEvict(fn)            // ShardedFixedRingPool[T]，传播到所有分片
+
+// 无锁 SPSC 队列：单生产者单消费者搬运对象（存指针，无锁无信号量）
+buffer.NewSpinSPSCQueue[T](cap) // *SpinSPSCQueue[T]，cap 向上取整到 2 的幂
+q.Enqueue(item *T) bool         // 满/关闭返回 false
+q.Dequeue() *T                  // 空则自旋；Close 后排空返回 nil
+q.TryDequeue() *T               // 空返回 nil（不阻塞）
+q.Close() / q.Closed()          // 关闭 / 查询
 
 // 分片分级池：外层按 key 分片、内层按 size 分档（高并发 + 多峰流量，如 RPC 网络库）
 buffer.NewShardedBufferClassPool(shardCount, boundaries, opts ...) // *ShardedClassPool[*bytes.Buffer]，Get(key,size)/Put(key,v)

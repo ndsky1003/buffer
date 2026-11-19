@@ -4,6 +4,8 @@ package buffer
 
 import (
 	"sync/atomic"
+
+	"golang.org/x/sys/cpu"
 )
 
 const (
@@ -25,8 +27,7 @@ const (
 // -----------------------------------------------------------------------------
 // 优化技巧：Cache Padding
 // -----------------------------------------------------------------------------
-// cacheLineSize 通常是 64 字节。我们用 padding 防止伪共享。
-type padding [64]byte
+// 用 cpu.CacheLinePad（golang.org/x/sys/cpu，64 字节）隔离高频读写字段，防止伪共享。
 
 // Pool 是一个自动伸缩的 bytes.Buffer 池
 type Pool[T any] struct {
@@ -44,14 +45,14 @@ type Pool[T any] struct {
 	calibratePeriod uint64
 	maxPercent      float64
 
-	_ padding // 隔离只读区和读写区
+	_ cpu.CacheLinePad // 隔离只读区和读写区
 
 	// 2. 运行时状态 (高频读写，原子操作)
 	calls        atomic.Uint64
-	_            padding       // 隔离 calls 和 maxUsage
-	maxUsage     atomic.Uint64 // 校准区间的最大使用者
-	_            padding       // 隔离 maxUsage 和 calibratedSz
-	calibratedSz atomic.Uint64 // 校准值，最新分配的大小
+	_            cpu.CacheLinePad // 隔离 calls 和 maxUsage
+	maxUsage     atomic.Uint64    // 校准区间的最大使用者
+	_            cpu.CacheLinePad // 隔离 maxUsage 和 calibratedSz
+	calibratedSz atomic.Uint64    // 校准值，最新分配的大小
 }
 
 // NewPool 创建一个新的智能池。

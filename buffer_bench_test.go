@@ -672,6 +672,44 @@ func BenchmarkFixedRingPoolParallel(b *testing.B) {
 	})
 }
 
+// =============================================================================
+// AdaptiveRingPool QPS 压测（sync.Mutex 版）
+// =============================================================================
+
+// BenchmarkAdaptiveRingPoolGetPut 单 goroutine Get/Put（1KB 数据）
+func BenchmarkAdaptiveRingPoolGetPut(b *testing.B) {
+	p := NewAdaptiveRingPool(func() *bytes.Buffer { return bytes.NewBuffer(make([]byte, 0, 1024)) })
+	data := make([]byte, 1024)
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		buf := p.Get()
+		buf.Reset()
+		buf.Write(data)
+		p.Put(buf)
+	}
+}
+
+// BenchmarkAdaptiveRingPoolParallel 并发 Get/Put（b.RunParallel，1KB 数据）
+func BenchmarkAdaptiveRingPoolParallel(b *testing.B) {
+	p := NewAdaptiveRingPoolWithLimit(DefaultMinCapacity, 1024, func() *bytes.Buffer {
+		return bytes.NewBuffer(make([]byte, 0, 1024))
+	})
+	data := make([]byte, 1024)
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			buf := p.Get()
+			buf.Reset()
+			buf.Write(data)
+			p.Put(buf)
+		}
+	})
+}
+
 // BenchmarkMaxQPSFixedRingPool 极限 QPS 压测（并发，1KB 数据）
 func BenchmarkMaxQPSFixedRingPool(b *testing.B) {
 	p := NewFixedRingPool(1024, func() *bytes.Buffer { return bytes.NewBuffer(make([]byte, 0, 1024)) })

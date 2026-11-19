@@ -2,7 +2,7 @@
 
 一个高性能的自适应缓冲池，用于复用 `*bytes.Buffer` 与 `[]byte`，消除热路径上的内存分配、降低 GC 压力。
 
-核心思路：用**环形队列 + 自旋锁**替代依赖 GC 的 `sync.Pool`，并通过 **EMA（指数加权移动平均）算法**自适应校准 buffer 大小——流量增大时快速扩容，减小时缓慢缩容，同时把异常大的 buffer 直接丢给 GC，防止内存虚高。
+核心思路：用**环形队列 + `sync.Mutex`**替代依赖 GC 的 `sync.Pool`，并通过 **EMA（指数加权移动平均）算法**自适应校准 buffer 大小——流量增大时快速扩容，减小时缓慢缩容，同时把异常大的 buffer 直接丢给 GC，防止内存虚高。
 
 ## 特性
 
@@ -11,7 +11,7 @@
 - **智能丢弃**：超过 `校准水位 × MaxPercent` 的 buffer 自动回收，防止大包污染池子
 - **分级池**：应对多峰流量（如 2KB 与 2MB 长期并存），支持手动分界或按 2 的幂自动分桶
 - **泛型**：`*bytes.Buffer` 与 `[]byte` 开箱即用，也可自定义类型
-- **无第三方依赖**
+- **无第三方依赖**（仅 `golang.org/x/sys`，为 `cpu.CacheLinePad` 防伪共享填充）
 
 ## 架构
 
@@ -22,23 +22,23 @@
 │
 ├── Pool[T]                单池：EMA 校准 + 智能丢弃
 │   └── AdaptiveRingPool[T]    底层存储：自适应伸缩环形队列
-│       └── SpinLock               自旋锁
+│       └── sync.Mutex
 │
 ├── ShardedPool[T]         分片池：高并发吞吐扩展
 │   └── Pool[T] × N            按 key 路由到 N 个独立 Pool
 │       └── AdaptiveRingPool[T]
-│           └── SpinLock
+│           └── sync.Mutex
 │
 ├── ClassPool[T]           分级池：多峰流量按 size 分档
 │   └── Pool[T] × N            按 size 路由到 N 个独立 Pool
 │       └── AdaptiveRingPool[T]
-│           └── SpinLock
+│           └── sync.Mutex
 │
 ├── ShardedClassPool[T]    分片分级池：高并发 + 多峰流量
 │   └── ClassPool[T] × N       按 key 路由到 N 个独立 ClassPool
 │       └── Pool[T] × M            按 size 路由到 M 个独立 Pool
 │           └── AdaptiveRingPool[T]
-│               └── SpinLock
+│               └── sync.Mutex
 │
 ├── FixedRingPool[T]       固定容量：满时覆盖最旧，热路径最短
 │   └── sync.Mutex
@@ -46,13 +46,14 @@
 └── ShardedFixedRingPool[T]  分片固定容量：高并发 + 容量可预知
     └── FixedRingPool[T] × N     按 key 路由到 N 个独立 FixedRingPool
         └── sync.Mutex
+
+└── SpinSPSCQueue[T]        无锁 SPSC 环形队列：单生产者单消费者搬运对象（独立于池）
 ```
 
 各层职责：
 
 | 类型 | 职责 | 适用场景 |
 |---|---|---|
-| `SpinLock` | 自旋锁，短临界区下比 `sync.Mutex` 快 2~2.6 倍 | 底层基础设施 |
 | `AdaptiveRingPool[T]` | 环形队列，按命中率伸缩容量（miss 多扩容、hit 多缩容） | `Pool` 的默认存储 |
 | `FixedRingPool[T]` | 环形队列，容量固定、满时覆盖最旧，无伸缩统计 | 容量可预知、追求极致吞吐 |
 | `ShardedFixedRingPool[T]` | 分片固定容量池：按 key 路由到 N 个独立 `FixedRingPool` | 高并发 + 容量可预知 |
@@ -60,57 +61,28 @@
 | `ShardedPool[T]` | 分片池，组合 N 个 `Pool` 按 key 路由 | 高并发（游戏服、网关） |
 | `ClassPool[T]` | 分级池，组合 N 个 `Pool` 按 size 路由 | 多峰流量（2KB 与 2MB 并存） |
 | `ShardedClassPool[T]` | 分片分级池，组合 N 个 `ClassPool` 按 key 路由、每片再按 size 分档 | 高并发 + 多峰流量（RPC 网络库） |
+| `SpinSPSCQueue[T]` | 无锁 SPSC 环形队列，单生产者单消费者搬运对象（存指针，避免拷贝大对象） | 日志采集→落盘、单连接读→处理、pipeline 环节间传递 |
 
 ## 性能
 
-> 测试环境：Apple M1（8 物理核），Go 1.21，负载 `Get → Write 1024B → Reset → Put`，全部 **0 分配**。
+> 测试环境：Apple M1（8 核），Go 1.27，全部 **0 分配**。负载：`FixedRingPool`/`AdaptiveRingPool` 为 `Get → Reset → Write 1024B → Put`，`Pool` 为 `Get → Write 1024B → Put`（Put 内自动 reset）。命令：`go test -run '^$' -bench 'BenchmarkFixedRingPool|BenchmarkAdaptiveRingPool|BenchmarkBufferPool|BenchmarkShardedFixedRingPool' -benchtime=2s -cpu=1,8`。
 
 ### 各池吞吐（ns/op，越低越好）
 
-| 实现 | 单核 | 8 核 | 32 核 | 64 核 |
-|---|---|---|---|---|
-| `FixedRingPool` | 29.3 | 79.2 | 109 | 113 |
-| `AdaptiveRingPool` | 35.2 | 97.6 | 126 | 135 |
-| `Pool`（含 EMA） | 39.6 | 117 | 175 | 201 |
-
-换算 QPS（Mops/s = 1000 / ns）：
-
-| 实现 | 单核 | 64 核 |
+| 实现 | 单 goroutine | 8 goroutine 争用 |
 |---|---|---|
-| `FixedRingPool` | 34.1 | 8.9 |
-| `AdaptiveRingPool` | 28.4 | 7.4 |
-| `Pool` | 25.2 | 5.0 |
+| `FixedRingPool` | 39 | 241 |
+| `AdaptiveRingPool` | 41 | 246 |
+| `Pool`（含 EMA） | 32 | 265 |
+| `ShardedFixedRingPool` | 38 | **23** |
 
-### 分片扩展性（高并发场景）
+- 前三行都是「单把锁」：单 goroutine 下 30~40ns；8 个 goroutine 抢同一把锁时吞吐掉到 ~240~290ns（下降约 6~8 倍）。
+- `ShardedFixedRingPool` 按 key 分片（分片数 = CPU 核数），每个 goroutine 落到独立分片、几乎无争用，吞吐不随并发下降（~23ns）。
+- 结论：高并发务必走 `Sharded*` 系列；单把锁的池只适合低并发，或作为分片池的内层。
 
-单 `Pool` 是单锁，多核争用下吞吐不升反降；`ShardedPool` 按 key 分片后吞吐随并发扩展：
+### 锁选型
 
-| 并发 | 单 `Pool` | `ShardedPool`（按 key） |
-|---|---|---|
-| 1 核 | 38.7 ns | 39.2 ns |
-| 8 核 | 119 ns | 34 ns |
-| 32 核 | 177 ns | 12.5 ns |
-| 64 核 | 187 ns | **10.0 ns** |
-
-### 锁选型依据（SpinLock vs sync.Mutex）
-
-| 并发 | SpinLock | sync.Mutex |
-|---|---|---|
-| 单核 | 33.9 ns | 40.3 ns |
-| 64 核 | 169 ns | 324 ns |
-
-自旋锁在「短临界区 + 高争用」下显著优于 `sync.Mutex`（多核争用快约 2 倍），这是 `AdaptiveRingPool` 选它的原因。而 `FixedRingPool` 的临界区更短、以单 goroutine/低争用为主，实测 `sync.Mutex` 略快（约 8%），故改用 `sync.Mutex`。
-
-### FixedRingPool 实测 QPS（Apple M4）
-
-> 测试环境：Apple M4（10 核），Go 1.27，负载 `Get → Reset → Write 1024B → Put`，0 分配。命令：`go test -bench 'BenchmarkFixedRingPool|BenchmarkShardedFixedRingPool' -benchtime=2s`。
-
-| 实现 | 单 goroutine（ns/op） | 并发 10 核（ns/op） |
-|---|---|---|
-| `FixedRingPool` | 15.0 | 191 |
-| `ShardedFixedRingPool` | — | **9.3** |
-
-单把锁串行化所有 Get/Put，`FixedRingPool` 并发争用下吞吐不升反降（约降 13 倍）；按 key 分片后（`ShardedFixedRingPool`）争用分散到各片，并发吞吐提升约 21 倍，甚至超过单 goroutine。
+所有池统一用 `sync.Mutex`（自旋锁已移除）。旧版「自旋锁比 `sync.Mutex` 快 2 倍」的结论来自 x86 多核机器；在 M1 上实测：自旋锁只在低争用（≤4 并发）领先（单 goroutine 约快 45%），≥8 并发时反而比 `sync.Mutex` 慢 2~10 倍（惊群 + 无 CPU 亲和 + 异步抢占），故弃用自旋锁。
 
 ## 安装
 
@@ -206,7 +178,7 @@ defer cp.Put(buf)
 
 ## 高并发：分片池
 
-单池是「一把自旋锁」，多核争用下吞吐不升反降（约 25 Mops/s 单核、争用后降到 5~8 Mops/s）。高并发场景（游戏服、网关）用**分片池**，把锁争用分散到多个分片，吞吐随分片数扩展：
+单池是「一把互斥锁」，多核争用下吞吐不升反降（约 25 Mops/s 单核、争用后降到 5~8 Mops/s）。高并发场景（游戏服、网关）用**分片池**，把锁争用分散到多个分片，吞吐随分片数扩展：
 
 ```go
 sp := buffer.NewShardedBufferPool(0) // 0 = 默认按 CPU 核数分片
@@ -273,9 +245,53 @@ defer sp.Put(shardKey, buf)
 
 `Get(key, size)` / `Put(key, v)` 的 key 语义与分片池一致（须稳定，如连接 ID 的哈希）；`size` 语义与分级池一致（期望大小，自动分桶时向上取整到 2 的幂）。也支持手动分界 `NewShardedByteClassPool(shardCount, boundaries)`。
 
+## 无锁 SPSC 队列：跨 goroutine 搬运对象
+
+`SpinSPSCQueue` 与上面的池**不是一类东西**：池负责**复用**对象，它负责在**一个生产者 goroutine 与一个消费者 goroutine**之间**传递**对象。无锁、无信号量，追求极低的搬运开销。
+
+```go
+q := buffer.NewSpinSPSCQueue[*bytes.Buffer](1024) // 容量向上取整到 2 的幂
+
+// 生产者：采集/接收，把 buffer 交给消费者
+go func() {
+	for {
+		buf := fetch()
+		for !q.Enqueue(buf) { // 满则自旋重试，或做背压
+			runtime.Gosched()
+		}
+	}
+}()
+
+// 消费者：取出处理（如落盘）
+for {
+	buf := q.Dequeue() // 空则自旋等待；Close 后排空返回 nil
+	handle(buf)
+	bufPool.Put(buf) // 处理完归还到对象池（队列与池配合使用）
+}
+```
+
+### 使用规范（违反即数据竞争）
+
+1. **严格单生产者、单消费者**：只能有一个 goroutine 调 `Enqueue`、一个 goroutine 调 `Dequeue`/`TryDequeue`。多生产者或多消费者会产生数据竞争，且**库不做任何检测**。
+2. **元素是指针**：`Enqueue(item *T)` 只存指针、不拷贝，对象由调用方分配；**入队后所有权移交消费者**，不得再修改。
+3. **处理「满」**：`Enqueue` 满返回 `false`，没有阻塞式入队——调用方决定重试、丢弃还是背压。
+4. **关闭顺序**：先停生产者，再 `Close()`；消费者 `Dequeue` 会排空剩余元素后返回 `nil`，用 `Closed()` 区分「空」与「已关闭」。
+5. **`TryDequeue` 用 nil 表示空**：若元素类型可能合法为 nil（如 `*bytes.Buffer`），别只靠 nil 判断状态，结合 `Closed()`。
+
+### 适用 / 不适用场景
+
+| 适用 | 不适用 |
+|---|---|
+| 单生产者 → 单消费者搬运（日志采集→落盘、单连接读→处理、pipeline 环节间传递、事件分发） | 多生产者或多消费者：改用 `channel`（有锁/有调度开销）或专门的 MPMC 队列 |
+| 追求低延迟、零锁、免唤醒开销 | 需要阻塞/超时等待、信号量公平性、优先级调度 |
+| 对象已由对象池管理，队列只负责搬运指针 | 元素需要长期滞留（有界，满即拒） |
+| 生产者/消费者角色固定（一个 reader 一个 writer） | 需要动态增减生产/消费者数量 |
+
+> 典型组合：`SpinSPSCQueue` 负责搬运 + `*Pool` 负责复用——生产者在队列里传递从池 `Get` 的 buffer，消费者用完 `Put` 回池。
+
 ## 工作原理
 
-1. **环形队列复用**：`AdaptiveRingPool` 用自旋锁实现，`Get`/`Put` 命中时零分配（字段紧凑排列——锁已串行化访问，缓存行填充反而降低吞吐）。
+1. **环形队列复用**：`AdaptiveRingPool` 用 `sync.Mutex` 实现，`Get`/`Put` 命中时零分配（字段紧凑排列——锁已串行化访问，缓存行填充反而降低吞吐）。
 2. **EMA 快涨慢跌**：水位上涨因子 `0.4`（对新值敏感、涨得快），下跌因子 `0.8`（对历史执着、跌得慢），并加 `1.05` 溢价，避免反复 `Grow`。
 3. **智能丢弃**：归还时若 buffer 容量远超当前水位（`cap > calibratedSz × MaxPercent`），直接丢弃交给 GC，防止内存虚高。
 
@@ -283,4 +299,4 @@ defer sp.Put(shardKey, buf)
 
 - **借了要尽快还**：`Get` 后务必配对 `Put`，且 buffer 生命周期要短。长期持有会占满池子、失去复用意义。
 - **校准统计的是 `Len`（实际使用量）**：正常 `Write` 数据即可让水位准确收敛；只 `Grow` 不 `Write` 时库会回退用 `Cap` 感知扩容，但缩容仍依赖真实 `Write`。
-- **单池是单自旋锁**：极高并发（几十核以上的全局热点）下扩展性受限（约 150ns/op 天花板）。若遇此场景，优先考虑按业务分多个池，而非换锁（实测自旋锁在该临界区下优于 `sync.Mutex`）。
+- **单池是单把锁**：极高并发（几十核以上的全局热点）下扩展性受限。若遇此场景，优先考虑按业务分多个池，而非换锁。

@@ -1,6 +1,7 @@
 package buffer
 
 import (
+	"sync"
 	"sync/atomic"
 )
 
@@ -22,10 +23,10 @@ const (
 	calibrateSamples = 1000
 )
 
-// 注意：本结构体字段由自旋锁串行化访问（关联访问）。
+// 注意：本结构体字段由 sync.Mutex 串行化访问（关联访问）。
 // 实测缓存行填充（padding）反而破坏局部性、降低吞吐，故采用紧凑排列。
 type AdaptiveRingPool[T any] struct {
-	mu       SpinLock     // 锁（高频）
+	mu       sync.Mutex   // 锁（高频）
 	head     int          // 取数位置（高频读写）
 	tail     int          // 放数位置（高频读写）
 	count    int          // 空闲数（高频读写）
@@ -77,7 +78,7 @@ func (p *AdaptiveRingPool[T]) Get() T {
 	}
 	p.mu.Unlock()
 
-	// 3. 无空闲对象，锁外新建，避免在自旋锁内做可能触发 GC 的分配
+	// 3. 无空闲对象，锁外新建，避免在锁内做可能触发 GC 的分配
 	return p.New()
 }
 
@@ -141,7 +142,7 @@ func (p *AdaptiveRingPool[T]) resize(newCap int) {
 	// 把原队列中的空闲对象按顺序拷贝到新数组。
 	// 缩容时 newCap 可能小于当前空闲对象数：只拷贝放得下的，多余对象直接丢弃。
 	copyCount := min(p.count, newCap)
-	for i := 0; i < copyCount; i++ {
+	for i := range copyCount {
 		srcIdx := (p.head + i) % p.curCap
 		newBuf[i] = p.buffer[srcIdx]
 	}

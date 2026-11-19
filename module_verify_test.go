@@ -2,43 +2,13 @@ package buffer
 
 import (
 	"fmt"
-	"sync"
 	"testing"
 )
 
-// ============ 模块 1：SpinLock 互斥 ============
-// 理想步骤：N 个 goroutine 并发 Lock → 递增共享计数器 → Unlock。
-// 正确性判据：计数器最终 == N×perG，无竞争丢失（配合 go test -race 验证无数据竞争）。
-func TestVerifySpinLock(t *testing.T) {
-	var lock SpinLock
-	var counter int64
-	const goroutines = 32
-	const perG = 10000
-	var wg sync.WaitGroup
-	for i := 0; i < goroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < perG; j++ {
-				lock.Lock()
-				counter++
-				lock.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	want := int64(goroutines * perG)
-	fmt.Printf("\n=== 模块1：SpinLock 互斥 ===\n")
-	fmt.Printf("计数器 = %d，期望 = %d（32×10000）\n", counter, want)
-	if counter != want {
-		t.Errorf("SpinLock 互斥失败：%d != %d", counter, want)
-	}
-}
-
-// ============ 模块 2：Option 配置 ============
+// ============ 模块 1：Option 配置 ============
 // 理想步骤：Options() → 链式 SetXxx → Merge（delta 非 nil 字段覆盖 base）。
 func TestVerifyOption(t *testing.T) {
-	fmt.Printf("\n=== 模块2：Option 配置 ===\n")
+	fmt.Printf("\n=== 模块1：Option 配置 ===\n")
 	o := Options().
 		SetMinSize(1024).
 		SetMaxSize(1 << 20).
@@ -73,11 +43,11 @@ func TestVerifyOption(t *testing.T) {
 	}
 }
 
-// ============ 模块 3：AdaptiveRingPool 伸缩 ============
+// ============ 模块 2：AdaptiveRingPool 伸缩 ============
 // 理想步骤：miss 多（Get 不 Put）→ 扩容；hit 多（Get 立即 Put）→ 缩容。
 // 预期：初始 32，miss 1000 次后扩容到 32×1.2=38，hit 1000 次后缩容到 max(38×0.8, 32)=32。
 func TestVerifyAdaptiveRingScale(t *testing.T) {
-	fmt.Printf("\n=== 模块3：AdaptiveRingPool 伸缩 ===\n")
+	fmt.Printf("\n=== 模块2：AdaptiveRingPool 伸缩 ===\n")
 	newCount := 0
 	p := NewAdaptiveRingPoolWithLimit(32, 512, func() int {
 		newCount++
@@ -112,11 +82,11 @@ func TestVerifyAdaptiveRingScale(t *testing.T) {
 	}
 }
 
-// ============ 模块 4：FixedRingPool 覆盖语义 ============
+// ============ 模块 3：FixedRingPool 覆盖语义 ============
 // 理想步骤：满时 Put 覆盖最旧（head），保持最新对象。
 // 预期：capacity=3，Put 1,2,3 后 Put 4 覆盖最旧的 1，Get 顺序 = 2,3,4。
 func TestVerifyFixedRingPool(t *testing.T) {
-	fmt.Printf("\n=== 模块4：FixedRingPool 覆盖语义 ===\n")
+	fmt.Printf("\n=== 模块3：FixedRingPool 覆盖语义 ===\n")
 	p := NewFixedRingPool(3, func() int { return -1 })
 	p.Put(1)
 	p.Put(2)
@@ -138,10 +108,10 @@ func TestVerifyFixedRingPool(t *testing.T) {
 	}
 }
 
-// ============ 模块 5：Pool 校准 + 智能丢弃 + len=0 ============
+// ============ 模块 4：Pool 校准 + 智能丢弃 + len=0 ============
 // 理想步骤：Get（len=0）→ 写满 size → Put（校准）；放 cap 远超水位的 buffer → 丢弃。
 func TestVerifyPool(t *testing.T) {
-	fmt.Printf("\n=== 模块5：Pool（len=0 + 校准收敛 + 智能丢弃）===\n")
+	fmt.Printf("\n=== 模块4：Pool（len=0 + 校准收敛 + 智能丢弃）===\n")
 	p := NewBytePool()
 	b := p.Get()
 	fmt.Printf("Get len=%d cap=%d（期望 len=0，cap=初始水位 max(512,1024)=1024）\n", len(b), cap(b))
@@ -184,10 +154,10 @@ func TestVerifyPool(t *testing.T) {
 	}
 }
 
-// ============ 模块 6：ShardedPool 分片独立 ============
+// ============ 模块 5：ShardedPool 分片独立 ============
 // 理想步骤：Get(key) → 写 → Put(key, v)，不同 key 独立校准、互不污染。
 func TestVerifyShardedPool(t *testing.T) {
-	fmt.Printf("\n=== 模块6：ShardedPool 分片独立 ===\n")
+	fmt.Printf("\n=== 模块5：ShardedPool 分片独立 ===\n")
 	sp := NewShardedBytePool(4)
 	for i := 0; i < 20000; i++ {
 		b0 := sp.Get(0)
@@ -218,10 +188,10 @@ func TestVerifyShardedPool(t *testing.T) {
 	}
 }
 
-// ============ 模块 7：ClassPool 分级归拢 + 自动分桶 ============
+// ============ 模块 6：ClassPool 分级归拢 + 自动分桶 ============
 // 理想步骤：Get(size) → 写满 → Put（按 cap 归拢），小/大请求各自归到正确桶、误差 ≤2×。
 func TestVerifyClassPool(t *testing.T) {
-	fmt.Printf("\n=== 模块7：ClassPool 分级归拢 + 自动分桶 ===\n")
+	fmt.Printf("\n=== 模块6：ClassPool 分级归拢 + 自动分桶 ===\n")
 	cp := NewByteAutoClassPool()
 	for i := 0; i < 30000; i++ {
 		if i%10 == 0 {
